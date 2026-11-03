@@ -1,0 +1,11 @@
+{
+  "name": "claude-memory",
+  "owner": { "name": "theslasher5g" },
+  "plugins": [
+    {
+      "name": "lean-memory",
+      "source": "./",
+      "description": "Token-efficient persistent memory for Claude Code"
+    }
+  ]
+}
