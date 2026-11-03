@@ -2,12 +2,14 @@
 // lean-memory CLI. Output is deliberately terse: every byte printed costs tokens.
 import { fileURLToPath } from 'node:url';
 import { spawnSync } from 'node:child_process';
+import fs from 'node:fs';
 import {
   LIMITS, TYPES, estTokens, openAll, stores, search, findSimilar, newId, buildIndex, shortId, rank,
   insert, update, remove, getById, bumpHits, resolve, topicCounts, write,
 } from './lib.mjs';
 
 const SELF = fileURLToPath(import.meta.url);
+const VERSION = (() => { try { return JSON.parse(fs.readFileSync(new URL('../.claude-plugin/plugin.json', import.meta.url), 'utf8')).version; } catch { return '?'; } })();
 const BOOL = new Set(['pin', 'global', 'apply', 'full']);
 
 function parse(argv) {
@@ -94,7 +96,7 @@ function run(cmd, pos, f) {
       const sc = stores(all).reduce((a, s) => a + s.db.prepare("SELECT COUNT(*) c FROM notes WHERE paths!=''").get().c, 0);
       const tracked = all.project && spawnSync('git', ['ls-files', '--error-unmatch', 'memory.db'], { cwd: all.d.project, stdio: 'ignore' }).status === 0;
       const warn = tracked ? '\nWARNING: memory.db is tracked by git (binary, changes on every read). Fix: git rm --cached .claude/memory/memory.db*' : '';
-      return `project ${n(all.project)}, global ${n(all.global)} (${sc} path-scoped); session-start cost ≈ ${estTokens(buildIndex(all, SELF))} tokens\n${all.d.project}\n${all.d.global}${warn}`;
+      return `lean-memory v${VERSION}\nproject ${n(all.project)}, global ${n(all.global)} (${sc} path-scoped); session-start cost ≈ ${estTokens(buildIndex(all, SELF))} tokens\n${all.d.project}\n${all.d.global}${warn}`;
     }
     case 'prune': {
       const days = Number(f.days) || 90, cutoff = new Date(Date.now() - days * 864e5).toISOString();

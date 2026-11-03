@@ -177,3 +177,9 @@ test('upgrade: old memory.db without notes.jsonl is exported once; incomplete .g
   spawnSync('git', ['add', '-f', '.claude/memory/memory.db'], { cwd: r });
   assert.match(mem('stats').stdout, /WARNING: memory\.db is tracked by git/);
 });
+
+test('stats reports the plugin version (to spot stale installs)', () => {
+  const v = JSON.parse(fs.readFileSync(path.join(root, '.claude-plugin/plugin.json'), 'utf8')).version;
+  assert.match(mem('stats').stdout, new RegExp(`^lean-memory v${v.replace(/\./g, '\\.')}`));
+  assert.notEqual(v, '0.1.0');
+});
