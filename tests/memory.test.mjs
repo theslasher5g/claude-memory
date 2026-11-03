@@ -164,3 +164,16 @@ test('topics counts path-scoped notes too', () => {
   mem('add', '--title', 'Scoped only topic note', '--body', 'zebra body unique', '--topic', 'security', '--paths', 'src/**');
   assert.match(mem('topics').stdout, /security\(1\)/);
 });
+
+test('upgrade: old memory.db without notes.jsonl is exported once; incomplete .gitignore is completed; stats warns if db is tracked', () => {
+  const { mem, dir, r } = repo();
+  mem('add', '--title', 'Old note papaya', '--body', 'papaya body unique');
+  fs.rmSync(path.join(dir, 'notes.jsonl'));
+  fs.writeFileSync(path.join(dir, '.gitignore'), 'memory.db-wal\nmemory.db-shm\n');
+  assert.match(mem('search', 'papaya').stdout, /Old note papaya/);           // plain read triggers the one-time export
+  assert.match(fs.readFileSync(path.join(dir, 'notes.jsonl'), 'utf8'), /papaya/);
+  assert.match(fs.readFileSync(path.join(dir, '.gitignore'), 'utf8'), /^memory\.db$/m);
+  spawnSync('git', ['init', '-q'], { cwd: r });
+  spawnSync('git', ['add', '-f', '.claude/memory/memory.db'], { cwd: r });
+  assert.match(mem('stats').stdout, /WARNING: memory\.db is tracked by git/);
+});

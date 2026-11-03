@@ -70,12 +70,19 @@ export function openStore(dir, scope, { create = false } = {}) {
     }
   }
   const store = { db, scope, dir, file, jsonl };
-  if (jsonl) {
+  if (jsonl) { // keep the cache out of git even if a .gitignore already exists (older versions / hand-made ones)
     const gi = path.join(dir, '.gitignore');
-    if (!fs.existsSync(gi)) { try { fs.writeFileSync(gi, 'memory.db\nmemory.db-wal\nmemory.db-shm\n'); } catch { /* best effort */ } }
+    try {
+      const cur = fs.existsSync(gi) ? fs.readFileSync(gi, 'utf8') : '';
+      const have = new Set(cur.split('\n').map((l) => l.trim()));
+      const miss = ['memory.db', 'memory.db-wal', 'memory.db-shm'].filter((w) => !have.has(w));
+      if (miss.length) fs.writeFileSync(gi, cur + (cur && !cur.endsWith('\n') ? '\n' : '') + miss.join('\n') + '\n');
+    } catch { /* best effort */ }
   }
   if (fs.existsSync(legacy)) migrate(store, legacy);
   syncFromJsonl(store);
+  // upgrade path: a pre-notes.jsonl database gets its text file once, so it can be committed instead of the binary
+  if (jsonl && !fs.existsSync(jsonl) && store.db.prepare('SELECT COUNT(*) c FROM notes').get().c > 0) exportJsonl(store);
   return store;
 }
 
