@@ -48,4 +48,4 @@ Ziel: Claude erinnert sich an Entscheidungen, Stolperfallen und Präferenzen, **
 `LEAN_MEMORY_INDEX_TOKENS` (500) · `LEAN_MEMORY_MAX_HITS` (3) · `LEAN_MEMORY_PROMPT_TOKENS` (250) · `LEAN_MEMORY_PATH_NOTES` (5) · `LEAN_MEMORY_PATH_TOKENS` (400)
 
 ## Tests
-`node --test tests/`
+`node --test`
