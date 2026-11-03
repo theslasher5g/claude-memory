@@ -21,14 +21,16 @@ Rules:
 1. One fact per note. Title = the claim, body = the why / how to apply.
 2. Save only what is durable, non-obvious and **not derivable from code, git log or docs**.
 3. Similar notes are merged automatically; to replace a specific one use `--supersede <id>`.
-4. Note applies to one area of the repo? Add `--paths` (globs, comma-separated, no braces). Such notes are hidden from the index and load automatically (once per session) when a matching file is read/edited — prefer this over a global note for anything area-specific.
+4. Note applies to one area of the repo? Add `--paths` (globs, comma-separated, no braces). Such notes are hidden from the index (unless pinned) and load automatically (once per session) when a matching file is read/edited or a matching path appears in a Bash/Grep/Glob call — prefer this over a global note for anything area-specific.
 5. Set `--topic` (default: first tag) so the topic overview stays meaningful.
 6. User-wide preferences → `--global`; project knowledge → default (project).
 7. Never store secrets, tokens or credentials.
 
 ## Maintain
 - `forget <id...>` remove outdated notes — do this as soon as you notice a note is wrong.
-- `pin <id>` keep an unscoped note always at the top of the index (no effect on path-scoped notes, they load by file).
+- `pin <id>` keep a note always visible in the index (also path-scoped ones: the title shows in the index, the body still loads by path). Use it sparingly for the few rules that must never be missed.
+- `doctor` – read-only health check: path globs that match no file, notes that mention files that no longer exist, near-duplicates, old never-fetched notes, topics with too many notes.
+- `merge <id> <id...> --title "…" --body "…"` – replace several notes by one (tags, paths, pin and topic carried over). For whole topics use `/lean-memory:consolidate <topic>`.
 - `prune [--days 90] [--apply]` drop unused, old, unpinned notes. `stats` shows the session-start token cost.
 
 ## Persistence & git

@@ -2,6 +2,7 @@
 // lean-memory CLI. Output is deliberately terse: every byte printed costs tokens.
 import { fileURLToPath } from 'node:url';
 import { spawnSync } from 'node:child_process';
+import { doctor } from './doctor.mjs';
 import fs from 'node:fs';
 import {
   LIMITS, TYPES, estTokens, openAll, stores, search, findSimilar, newId, buildIndex, shortId, rank,
@@ -61,7 +62,7 @@ function run(cmd, pos, f) {
   if (cmd === 'add') {
     return cmdAdd(all, f);
   }
-  if (!stores(all).length && !['index', 'stats', 'topics', 'list', 'search', undefined].includes(cmd)) return 'empty';
+  if (!stores(all).length && !['index', 'stats', 'topics', 'list', 'search', 'doctor', undefined].includes(cmd)) return 'empty';
   switch (cmd) {
     case 'search': {
       const res = search(all, pos.join(' '), { limit: Number(f.limit) || 5, topic: f.topic });
@@ -77,7 +78,27 @@ function run(cmd, pos, f) {
     case 'list': {
       const es = every(all, f.topic ? 'SELECT id FROM notes WHERE topic=?' : 'SELECT id FROM notes', f.topic ? [f.topic] : [])
         .filter((e) => !f.type || e.type === f.type).sort((a, b) => rank(b) - rank(a)).slice(0, Number(f.limit) || 50);
-      return es.length ? es.map((e) => fmt(e, false)).join('\n') : 'empty';
+      return es.length ? es.map((e) => fmt(e, !!f.full)).join('\n') : 'empty';
+    }
+    case 'merge': {
+      if (pos.length < 2) die('usage: merge <id> <id...> --title "" --body "" [--type T] [--topic t] [--tags a,b] [--paths globs] [--pin]');
+      const items = pos.map((ref) => resolve(all, ref));
+      const bad = pos.filter((_, i) => !items[i]); if (bad.length) die(`not found: ${bad.join(' ')}`);
+      if (new Set(items.map((t) => t.store.scope)).size > 1) die('cannot merge project and global notes');
+      const title = clean(f.title), body = clean(f.body);
+      if (!title || !body) die('--title and --body required (write the merged note yourself; nothing is lost silently)');
+      if (title.length > LIMITS.title) die(`title ${title.length}ch > ${LIMITS.title}; condense`);
+      if (body.length > LIMITS.body) die(`body ${body.length}ch > ${LIMITS.body}; condense (or merge fewer notes)`);
+      const store = items[0].store, olds = items.map((t) => t.e);
+      const tags = [...new Set([...olds.flatMap((e) => e.tags), ...list(f.tags)])];
+      const paths = f.paths ? clean(f.paths).split(',').map((s) => s.trim()).filter(Boolean) : [...new Set(olds.flatMap((e) => e.paths))];
+      const note = { id: newId(store), type: f.type || olds[0].type, title, body, tags, topic: f.topic ? clean(f.topic).toLowerCase() : olds[0].topic, paths, pinned: !!f.pin || olds.some((e) => e.pinned), scope: store.scope };
+      write(store, () => { for (const e of olds) remove(store, e.id); insert(store, note); });
+      return `merged ${olds.length} -> ${shortId(note)}`;
+    }
+    case 'doctor': {
+      const r = doctor(all, all.d.root, { days: Number(f.days) || 90, maxTopic: Number(f.max) || 12, scriptPath: SELF });
+      return [r.head, ...r.findings.map(([k, id, msg]) => `${k} ${id}: ${msg}`)].join('\n');
     }
     case 'topics': { const t = topicCounts(all, { includeScoped: true }); return t.length ? t.map(([n, c]) => `${n}(${c})`).join(' ') : 'empty'; }
     case 'forget': {
@@ -107,9 +128,9 @@ function run(cmd, pos, f) {
       return `removed ${stale.length}`;
     }
     default:
-      return 'usage: add|search|get|list|topics|forget|pin|unpin|index|stats|prune\n' +
+      return 'usage: add|search|get|list|topics|merge|doctor|forget|pin|unpin|index|stats|prune\n' +
         '  add --type T --title "" --body "" [--tags a,b] [--topic t] [--paths "src/x/**,docs/y.md"] [--global] [--pin] [--supersede id]\n' +
-        '  search <query> [--topic t] [--limit N] [--full] | get <id...> | list [--topic t] [--type T]\n  forget <id...> | prune [--days N] [--apply]';
+        '  search <query> [--topic t] [--limit N] [--full] | get <id...> | list [--topic t] [--type T] [--full]\n  merge <id> <id...> --title "" --body "" | doctor [--days N] [--max N] | forget <id...> | prune [--days N] [--apply]';
   }
 }
 

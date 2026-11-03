@@ -1,6 +1,6 @@
 {
   "name": "lean-memory",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "description": "Token-efficient persistent memory for Claude Code: tiny budgeted index at session start, BM25 recall on demand, deduplicated atomic notes.",
   "author": { "name": "theslasher5g" },
   "license": "MIT",

@@ -183,3 +183,96 @@ test('stats reports the plugin version (to spot stale installs)', () => {
   assert.match(mem('stats').stdout, new RegExp(`^lean-memory v${v.replace(/\./g, '\\.')}`));
   assert.notEqual(v, '0.1.0');
 });
+
+test('stress: concurrent writers AND readers never lose a note (db and notes.jsonl agree)', async () => {
+  const { r, dir } = repo();
+  const e = { ...process.env, CLAUDE_PROJECT_DIR: r, LEAN_MEMORY_GLOBAL_DIR: path.join(r, '_g') };
+  delete e.LEAN_MEMORY_DIR;
+  const names = ['amber', 'basalt', 'cobalt', 'dune', 'ember', 'fjord', 'gale', 'heron', 'ivory', 'jasper', 'kelp', 'lava'];
+  const procs = [];
+  names.forEach((w, i) => {
+    procs.push(new Promise((res) => spawn('node', [path.join(root, 'scripts/mem.mjs'), 'add', '--title', `${w} unique-${w}${i}`, '--body', `${w}${w} ${w}x${i} only`, '--topic', 'stress'], { env: e, cwd: r }).on('close', res)));
+    procs.push(new Promise((res) => spawn('node', [path.join(root, 'scripts/mem.mjs'), 'search', 'amber basalt'], { env: e, cwd: r }).on('close', res)));
+    procs.push(new Promise((res) => { const p = spawn('node', [path.join(root, 'scripts/session-start.mjs')], { env: e, cwd: r }); p.stdin.end('{}'); p.on('close', res); }));
+  });
+  await Promise.all(procs);
+  const inFile = fs.readFileSync(path.join(dir, 'notes.jsonl'), 'utf8').trim().split('\n').length;
+  const inDb = spawnSync('node', [path.join(root, 'scripts/mem.mjs'), 'list', '--topic', 'stress', '--limit', '50'], { env: e, cwd: r, encoding: 'utf8' }).stdout.trim().split('\n').length;
+  assert.equal(inFile, names.length, 'notes.jsonl');
+  assert.equal(inDb, names.length, 'sqlite');
+});
+
+// ---- v0.4: doctor, merge, pinned scoped notes, topic in search, Bash/Grep/Glob path hooks ----
+function gitRepo(files) {
+  const x = repo();
+  fs.rmSync(path.join(x.r, '.git'), { recursive: true });
+  spawnSync('git', ['init', '-q', '.'], { cwd: x.r });
+  for (const f of files) { fs.mkdirSync(path.dirname(path.join(x.r, f)), { recursive: true }); fs.writeFileSync(path.join(x.r, f), 'x'); }
+  spawnSync('git', ['add', '-A'], { cwd: x.r });
+  return x;
+}
+
+test('doctor: stale path globs, missing files, near-duplicates, consolidation hints; clean notes are not flagged', () => {
+  const { mem } = gitRepo(['src/billing/tax.rs', 'docs/guide.md']);
+  mem('add', '--title', 'Billing rounds half-even', '--body', 'Never use toFixed in src/billing/tax.rs; round half-even.', '--paths', 'src/billing/**', '--topic', 'billing');
+  mem('add', '--title', 'Old module rule', '--body', 'The legacy importer lives in src/legacy/importer.py and must stay.', '--paths', 'src/legacy/**', '--topic', 'legacy');
+  mem('add', '--title', 'Deploy needs VPN access', '--body', 'Staging deploy requires the company VPN, otherwise ssh times out on port 22.', '--topic', 'ops');
+  mem('add', '--title', 'Deploy requires VPN', '--body', 'Staging deploy needs the company VPN, or ssh times out on port 22 always.', '--topic', 'ops');
+  for (let i = 0; i < 13; i++) mem('add', '--title', `Crowded topic fact ${'abcdefghijklmnop'[i]}${i}`, '--body', `distinct body ${'qrstuvwxyzabc'[i]}${i}${i} ${'mnopqrstuvwxy'[i]}`, '--topic', 'crowded');
+  const out = mem('doctor').stdout;
+  assert.match(out, /^\d+ notes \(\d+ path-scoped, 0 pinned\), session-start cost ≈ \d+ tokens/);
+  assert.match(out, /STALE-PATH \w+: path "src\/legacy\/\*\*" matches no file/);
+  assert.match(out, /MISSING-FILE \w+: mentions src\/legacy\/importer\.py/);
+  assert.match(out, /DUPLICATE\? \w+ \w+: \d+% overlap/);
+  assert.match(out, /CONSOLIDATE crowded: 13 notes/);
+  assert.doesNotMatch(out, /STALE-PATH \w+: path "src\/billing/);        // matches a real file
+  assert.doesNotMatch(out, /MISSING-FILE[^\n]*tax\.rs/);                  // exists
+});
+
+test('merge: unions tags/paths, removes the originals, updates notes.jsonl, refuses oversized or cross-scope merges', () => {
+  const { mem, dir } = repo();
+  const id = (out) => out.trim().split(' ')[1];
+  const a = id(mem('add', '--title', 'Signing step one', '--body', 'commit the public key first', '--tags', 'release', '--paths', '.github/**', '--topic', 'release').stdout);
+  const b = id(mem('add', '--title', 'Signing step two', '--body', 'then set the secret, then push the tag', '--tags', 'signing', '--paths', 'packaging/keys/**', '--topic', 'release', '--pin').stdout);
+  const g = id(mem('add', '--global', '--title', 'Global pref unique kiwi', '--body', 'prefers german').stdout);
+  assert.notEqual(mem('merge', a, `g-${g}`, '--title', 'x', '--body', 'y').status, 0);               // cross-scope
+  assert.notEqual(mem('merge', a, b, '--title', 'x', '--body', 'z'.repeat(600)).status, 0);          // too long
+  assert.notEqual(mem('merge', a, b, '--title', 'only title').status, 0);                              // body required
+  assert.match(mem('merge', a, b, '--title', 'Signed release order', '--body', 'public key -> secret -> tag').stdout, /merged 2 -> /);
+  const rows = fs.readFileSync(path.join(dir, 'notes.jsonl'), 'utf8').trim().split('\n').map((l) => JSON.parse(l));
+  const m = rows.find((r) => r.title === 'Signed release order');
+  assert.ok(m && !rows.some((r) => r.id === a || r.id === b));
+  assert.deepEqual(m.tags.sort(), ['release', 'signing']);
+  assert.deepEqual(m.paths.sort(), ['.github/**', 'packaging/keys/**']);
+  assert.equal(m.pinned, true); assert.equal(m.topic, 'release');
+});
+
+test('pinned notes appear in the index even when path-scoped; unpinned scoped notes stay out', () => {
+  const { mem, sh } = repo();
+  mem('add', '--title', 'Critical signing order rule', '--body', 'public key, secret, tag', '--paths', 'packaging/**', '--pin');
+  mem('add', '--title', 'Ordinary scoped note quince', '--body', 'quince body', '--paths', 'docs/**');
+  const idx = ctx(sh('session-start.mjs', [], '{}'));
+  assert.match(idx, /Critical signing order rule/);
+  assert.doesNotMatch(idx, /Ordinary scoped note/);
+});
+
+test('the topic is searchable: "release" finds a note of topic release that never says the word', () => {
+  const { mem } = repo();
+  mem('add', '--title', 'Bump versions by hand', '--body', 'workflow default, changelog and manifest must change together', '--topic', 'release');
+  assert.match(mem('search', 'release').stdout, /Bump versions by hand/);
+});
+
+test('path hook also fires for Bash, Grep and Glob that name a matching path (once per session)', () => {
+  const { mem, sh, r } = repo();
+  mem('add', '--title', 'RDP drive share is read-only by default', '--body', 'symlinks are never followed', '--paths', 'crates/rdp/src/drive*.rs,crates/rdp/vendor/**', '--topic', 'rdp');
+  const ev = (tool_name, tool_input, sid) => JSON.stringify({ session_id: sid, cwd: r, tool_name, tool_input });
+  const fire = (tool_name, tool_input) => ctx(sh('pre-tool-use.mjs', [], ev(tool_name, tool_input, sid())));
+  assert.match(fire('Bash', { command: 'grep -n "wildcard" crates/rdp/src/drive.rs | head' }), /read-only by default/);
+  assert.match(fire('Bash', { command: 'cat ./crates/rdp/vendor/ironrdp/src/lib.rs' }), /read-only by default/);
+  assert.match(fire('Grep', { pattern: 'x', path: 'crates/rdp' }), /read-only by default/);          // directory that contains scoped paths
+  assert.match(fire('Glob', { pattern: 'crates/rdp/vendor/**/*.rs' }), /read-only by default/);
+  assert.equal(fire('Bash', { command: 'npm test && ls -la' }), '');                                    // no path at all
+  assert.equal(fire('Bash', { command: 'cat src/other/file.rs' }), '');                                 // unrelated path
+  const s = sid(); const call = () => sh('pre-tool-use.mjs', [], ev('Bash', { command: 'cat crates/rdp/src/drive.rs' }, s)).stdout;
+  assert.notEqual(call(), ''); assert.equal(call(), '');                                                // once per session
+});

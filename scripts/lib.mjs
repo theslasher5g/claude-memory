@@ -82,7 +82,7 @@ export function openStore(dir, scope, { create = false } = {}) {
   if (fs.existsSync(legacy)) migrate(store, legacy);
   syncFromJsonl(store);
   // upgrade path: a pre-notes.jsonl database gets its text file once, so it can be committed instead of the binary
-  if (jsonl && !fs.existsSync(jsonl) && store.db.prepare('SELECT COUNT(*) c FROM notes').get().c > 0) exportJsonl(store);
+  if (jsonl && !fs.existsSync(jsonl) && store.db.prepare('SELECT COUNT(*) c FROM notes').get().c > 0) tx(store.db, () => { if (!fs.existsSync(jsonl)) exportJsonl(store); });
   return store;
 }
 
@@ -90,14 +90,19 @@ const sigOf = (f) => { try { const st = fs.statSync(f); return `${st.size}:${Mat
 const metaGet = (db, k) => db.prepare('SELECT v FROM meta WHERE k=?').get(k)?.v;
 const metaSet = (db, k, v) => db.prepare('INSERT OR REPLACE INTO meta(k,v) VALUES(?,?)').run(k, v);
 
-/** Rebuild the SQLite cache from notes.jsonl when the file changed since we last saw it. Local hit counters survive. */
+/**
+ * Rebuild the SQLite cache from notes.jsonl when the file changed since we last saw it (clone, pull, branch switch). Local hit counters survive.
+ * The decision is re-made INSIDE the write lock from the file as it is then: writers update file and meta in one transaction (see write()),
+ * so a rebuild can never throw away a note that another process has just stored but not yet exported.
+ */
 function syncFromJsonl(store) {
   if (!store.jsonl) return;
-  const sig = sigOf(store.jsonl);
-  if (!sig || metaGet(store.db, 'jsonl_sig') === sig) return;
-  const rows = fs.readFileSync(store.jsonl, 'utf8').split('\n').filter(Boolean).map((l) => { try { return JSON.parse(l); } catch { return null; } }).filter((e) => e && e.id && e.title);
+  const sig0 = sigOf(store.jsonl);
+  if (!sig0 || metaGet(store.db, 'jsonl_sig') === sig0) return;
   tx(store.db, () => {
-    if (metaGet(store.db, 'jsonl_sig') === sig) return; // another process already synced
+    const sig = sigOf(store.jsonl);
+    if (!sig || metaGet(store.db, 'jsonl_sig') === sig) return; // a writer/another process already brought them in line
+    const rows = fs.readFileSync(store.jsonl, 'utf8').split('\n').filter(Boolean).map((l) => { try { return JSON.parse(l); } catch { return null; } }).filter((e) => e && e.id && e.title);
     const hits = new Map(store.db.prepare('SELECT id,hits FROM notes').all().map((r) => [r.id, r.hits]));
     store.db.exec('DELETE FROM notes; DELETE FROM fts;');
     for (const e of rows) insert(store, { ...e, tags: e.tags || [], paths: e.paths || [], hits: hits.get(e.id) || 0 });
@@ -105,7 +110,7 @@ function syncFromJsonl(store) {
   });
 }
 
-/** Write the committed text file (sorted by id, no local counters) after a content change. */
+/** Write the committed text file (sorted by id, no local counters). Call inside a transaction (write() does). */
 export function exportJsonl(store) {
   if (!store.jsonl) return;
   const rows = store.db.prepare('SELECT id,type,title,body,tags,topic,paths,created,updated,pinned FROM notes ORDER BY id').all();
@@ -116,11 +121,9 @@ export function exportJsonl(store) {
   metaSet(store.db, 'jsonl_sig', sigOf(store.jsonl));
 }
 
-/** Transaction + export. Use for every content change (not for hit counters). */
+/** Content change = one IMMEDIATE transaction that changes the rows AND rewrites notes.jsonl (+ its signature). Not for hit counters. */
 export function write(store, fn) {
-  const r = tx(store.db, fn);
-  exportJsonl(store);
-  return r;
+  return tx(store.db, () => { const r = fn(); exportJsonl(store); return r; });
 }
 
 function migrate(store, legacy) {
@@ -128,7 +131,7 @@ function migrate(store, legacy) {
     const rows = fs.readFileSync(legacy, 'utf8').split('\n').filter(Boolean).map((l) => { try { return JSON.parse(l); } catch { return null; } }).filter(Boolean);
     tx(store.db, () => { for (const e of rows) if (!getById(store, e.id)) insert(store, { ...e, tags: e.tags || [], paths: [], topic: e.tags?.[0] }); });
     fs.renameSync(legacy, legacy + '.migrated');
-    exportJsonl(store);
+    tx(store.db, () => exportJsonl(store));
   } catch { /* leave the legacy file untouched */ }
 }
 
@@ -149,7 +152,7 @@ export const shortId = (e) => (e.scope === 'global' ? 'g-' : '') + e.id;
 
 function ftsPut(db, n, e) {
   db.prepare('DELETE FROM fts WHERE rowid=?').run(n);
-  db.prepare('INSERT INTO fts(rowid,title,tags,body) VALUES(?,?,?,?)').run(n, norm(e.title), norm((e.tags || []).join(' ')), norm(e.body));
+  db.prepare('INSERT INTO fts(rowid,title,tags,body) VALUES(?,?,?,?)').run(n, norm(e.title), norm([...(e.tags || []), e.topic || ''].join(' ')), norm(e.body));
 }
 
 export function insert(store, e) {
@@ -157,7 +160,7 @@ export function insert(store, e) {
   const tags = e.tags || [];
   const r = store.db.prepare('INSERT INTO notes(id,type,title,body,tags,topic,paths,created,updated,pinned,hits) VALUES(?,?,?,?,?,?,?,?,?,?,?)')
     .run(e.id, e.type, e.title, e.body, tags.join(','), e.topic || tags[0] || 'misc', (e.paths || []).join(','), e.created || now, e.updated || now, e.pinned ? 1 : 0, e.hits || 0);
-  ftsPut(store.db, Number(r.lastInsertRowid), { ...e, tags });
+  ftsPut(store.db, Number(r.lastInsertRowid), { ...e, tags, topic: e.topic || tags[0] || 'misc' });
 }
 
 export function update(store, id, patch) {
@@ -165,7 +168,7 @@ export function update(store, id, patch) {
   const e = { ...cur, ...patch, updated: new Date().toISOString() };
   store.db.prepare('UPDATE notes SET type=?,title=?,body=?,tags=?,topic=?,paths=?,updated=?,pinned=? WHERE id=?')
     .run(e.type, e.title, e.body, e.tags.join(','), e.topic || e.tags[0] || 'misc', e.paths.join(','), e.updated, e.pinned ? 1 : 0, id);
-  ftsPut(store.db, store.db.prepare('SELECT n FROM notes WHERE id=?').get(id).n, e);
+  ftsPut(store.db, store.db.prepare('SELECT n FROM notes WHERE id=?').get(id).n, { ...e, topic: e.topic || e.tags[0] || 'misc' });
 }
 
 export function remove(store, id) {
@@ -258,17 +261,17 @@ export function buildIndex(all, scriptPath, { budgetTokens = Number(process.env.
   const head = `[memory] ${total} notes. Details: node "${scriptPath}" get <id> | search <query> [--topic t]. ` +
     `Save: node "${scriptPath}" add --type decision|fact|pref|gotcha --title "<=${LIMITS.title}ch" --body "<=${LIMITS.body}ch" [--tags a,b] [--topic t] [--paths globs] [--global]. ` +
     `Save only durable, non-obvious facts not derivable from code; reuse existing notes instead of duplicating.` +
-    (scoped ? `\n${scoped} path-scoped notes load automatically when matching files are read/edited.` : '');
+    (scoped ? `\n${scoped} path-scoped notes load automatically when matching files are read, edited, or named in a Bash/Grep/Glob call.` : '');
   let budget = budgetTokens * 4 - head.length;
   const line = (e) => `${shortId(e)} ${e.type[0]}${e.pinned ? '*' : ''} ${e.title}`;
   const fetch = (sql, ...p) => stores(all).flatMap((s) => s.db.prepare(sql).all(...p).map((r) => toNote(r, s)));
 
-  const pinned = fetch("SELECT * FROM notes WHERE pinned=1 AND paths=''").sort(byRank);
+  const pinned = fetch('SELECT * FROM notes WHERE pinned=1').sort(byRank);
   const lines = [];
   const take = (e) => { const l = line(e); if (budget - l.length - 1 < 40) return false; lines.push(l); budget -= l.length + 1; return true; };
   pinned.forEach(take);
 
-  const unpinnedCount = total - scoped - pinned.length;
+  const unpinnedCount = count(all, "WHERE pinned=0 AND paths=''");
   let rest;
   if (unpinnedCount <= 300) rest = fetch("SELECT * FROM notes WHERE pinned=0 AND paths=''").sort(byRank);
   else rest = fetch("SELECT * FROM (SELECT * FROM notes WHERE pinned=0 AND paths='' ORDER BY updated DESC LIMIT 150) UNION SELECT * FROM (SELECT * FROM notes WHERE pinned=0 AND paths='' ORDER BY hits DESC LIMIT 150)").sort(byRank);
@@ -303,6 +306,40 @@ export function globToRegex(g) {
     else re += c.replace(/[.+^${}()|[\]\\]/g, '\\$&');
   }
   return new RegExp('^' + re + '$');
+}
+
+/** Does a note's path glob cover `cand` (a file) or lie under `cand` (a directory the tool is about to look at)? */
+export function globOverlaps(glob, cand) {
+  const g = glob.trim().replace(/^\.?\//, '');
+  if (globToRegex(g).test(cand)) return true;
+  const stat = g.split(/[*?]/)[0];                       // static prefix before the first wildcard
+  const dir = cand.endsWith('/') ? cand : cand + '/';
+  return cand.length > 1 && stat.length > 0 && stat.startsWith(dir);
+}
+
+/** Path-like tokens in a shell command: foo/bar.rs, ./dir, crates/x/**, Cargo.toml ... made relative to the project root. */
+export function pathsInCommand(cmd, root) {
+  const out = new Set();
+  for (let t of String(cmd).split(/[\s;|&<>()`'"=]+/)) {
+    if (!t || t.startsWith('-') || t.length > 200) continue;
+    t = t.replace(/^\.\//, '');
+    if (path.isAbsolute(t)) { const rel = path.relative(root, t); if (rel.startsWith('..')) continue; t = rel; }
+    if (t === '.' || t === '..' || t.startsWith('$')) continue;
+    if (t.includes('/') || /\.[A-Za-z][\w]{0,5}$/.test(t)) out.add(t.replace(/\/+$/, ''));
+    if (out.size >= 12) break;
+  }
+  return [...out].filter(Boolean);
+}
+
+export function pathNotesFor(all, candidates) {
+  const hit = new Map();
+  for (const s of stores(all)) {
+    for (const r of s.db.prepare("SELECT * FROM notes WHERE paths != ''").all()) {
+      const e = toNote(r, s);
+      if (candidates.some((c) => e.paths.some((p) => globOverlaps(p, c)))) hit.set(shortId(e), e);
+    }
+  }
+  return [...hit.values()].sort(byRank);
 }
 
 export function pathNotes(all, relPath) {

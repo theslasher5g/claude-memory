@@ -9,7 +9,7 @@ Goal: Claude remembers decisions, gotchas and preferences **without** loading a 
 | Tier | When | What | Cost |
 |---|---|---|---|
 | 1. Index | SessionStart (also after `/clear`, `/compact`) | Small stores: titles. Large stores: pinned titles + **topic overview** `billing(23) auth(14)…` + top titles. Hard budget (500 tokens) | constant, independent of the number of notes |
-| 2. Path notes | PreToolUse on Read/Edit/Write | Notes with `--paths` load only when a matching file is touched; once per session | 0 tokens elsewhere |
+| 2. Path notes | PreToolUse on Read/Edit/Write/Grep/Glob/Bash | Notes with `--paths` load only when a matching file is touched **or a matching path is named** in a Grep/Glob/Bash call (`grep x crates/rdp/src/drive.rs`, `Grep path=crates/rdp`); once per session | 0 tokens elsewhere |
 | 3. Auto-recall | UserPromptSubmit | max. 3 notes, only on a strong BM25 match, never twice, 250-token cap | 0 on a weak match |
 | 4. Lookup | on demand | `search [--topic t]` → snippets, `get <id>` → full text | only what is needed |
 
@@ -23,6 +23,8 @@ Goal: Claude remembers decisions, gotchas and preferences **without** loading a 
 ## More savings
 - Atomic notes with hard limits (title ≤ 80, body ≤ 500 characters).
 - Dedupe/supersede: similar notes are merged, `--supersede <id>` replaces a specific one.
+- The topic is part of the search index: a note of topic `release` is found by the word "release" even if its text never says it.
+- Pinned notes (`pin`) always show their title in the index, even when path-scoped.
 - `prune` removes old, unused, unpinned notes.
 - Terse CLI output, German + English stop words.
 
@@ -32,6 +34,11 @@ Goal: Claude remembers decisions, gotchas and preferences **without** loading a 
 - **Global (`--global`):** `~/.claude/memory/memory.db`, not in Git (personal preferences).
 - Overridable: `LEAN_MEMORY_DIR`, `LEAN_MEMORY_GLOBAL_DIR`.
 - Upgrade path: a database from an older version without `notes.jsonl` is exported once on first access; `stats` warns if `memory.db` is still tracked by Git.
+
+## Maintenance: doctor, merge, consolidate
+- `doctor` (read-only): path globs that match no tracked file (`STALE-PATH`), notes that mention files that no longer exist (`MISSING-FILE`), near-duplicates below the auto-merge threshold (`DUPLICATE?`), old notes never fetched on this clone (`UNUSED`, a hint only because hit counters are local), and topics with more than 12 notes (`CONSOLIDATE`). It also prints the session-start cost.
+- `merge <id> <id...> --title "…" --body "…"`: replaces several notes by one; tags and paths are unioned, pin and topic carried over, both stores' `notes.jsonl` updated atomically. It refuses oversized bodies and project+global mixes.
+- `/lean-memory:consolidate <topic>`: Claude reads the topic, groups notes about the same thing and writes merged notes with `merge` (never dropping a fact; groups that do not fit into 500 characters stay separate).
 
 ## Automatic start in new repos
 If a Git repo has no notes yet, the SessionStart hook adds a short hint once (~70 tokens). Claude finishes the first request and then runs `/lean-memory:bootstrap`: bounded (~10 reads, max. 25 notes), only non-derivable facts, a fixed topic list, path binding for folder-specific rules. Afterwards the hint disappears. Disable with `LEAN_MEMORY_AUTOBOOTSTRAP=0`. The bootstrap costs tokens once for the exploration.
@@ -62,14 +69,19 @@ Measured on a real repo (aurora-ssh, Rust, 30 notes, 24 of them path-scoped) wit
 ```
 
 ## Usage
-- `/lean-memory:bootstrap` (initial fill) · `/lean-memory:remember <text>` · `/lean-memory:recall <query>` · `/lean-memory:forget <id>`
+- `/lean-memory:bootstrap` (initial fill) · `/lean-memory:consolidate <topic>` · `/lean-memory:remember <text>` · `/lean-memory:recall <query>` · `/lean-memory:forget <id>`
 - CLI (Claude uses it itself, see `skills/memory/SKILL.md`):
-  `node scripts/mem.mjs add|search|get|list|topics|forget|pin|unpin|index|stats|prune`
+  `node scripts/mem.mjs add|search|get|list|topics|merge|doctor|forget|pin|unpin|index|stats|prune`
 - Path-scoping example: `add --title "Round half-even" --body "…" --paths "src/billing/**" --topic billing`
 - `stats` shows the plugin version and the session-start cost in tokens.
 
 ## Settings (env)
 `LEAN_MEMORY_INDEX_TOKENS` (500) · `LEAN_MEMORY_MAX_HITS` (3) · `LEAN_MEMORY_PROMPT_TOKENS` (250) · `LEAN_MEMORY_PATH_NOTES` (5) · `LEAN_MEMORY_PATH_TOKENS` (400) · `LEAN_MEMORY_AUTOBOOTSTRAP` (`0` disables the bootstrap hint)
+
+## Changelog
+- **0.4.0** – `doctor`, `merge`, `/lean-memory:consolidate`; path notes now also load for Grep/Glob/Bash (in the measurement above Claude used almost only Bash/Grep, so the path hook never fired); pinned path-scoped notes appear in the index; topic is searchable. **Fix:** `notes.jsonl` and the SQLite cache could lose a note when sessions wrote and opened the store at the same time (cache rebuild raced with an unexported write). Writes and export now share one transaction and a rebuild re-checks the file under the lock; a stress test (concurrent writers and readers) reproduces the old bug in 3 of 8 runs and passes with the fix. **0.3.0 is affected, please update.**
+- **0.3.0** – `notes.jsonl` as git-tracked source of truth, automatic bootstrap hint, version in `stats`.
+- **0.2.0** – SQLite/FTS5 storage, path-scoped notes, topic index.
 
 ## Tests
 `node --test`

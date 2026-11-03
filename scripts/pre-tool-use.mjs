@@ -1,24 +1,33 @@
 #!/usr/bin/env node
-// PreToolUse hook (Read/Edit/Write/...): load path-scoped notes when Claude touches a matching file.
-// Zero tokens for files without scoped notes; each note is injected once per session.
+// PreToolUse hook: load path-scoped notes when Claude touches a matching file or names a matching path.
+// Covers Read/Edit/Write (file_path), Grep/Glob (path, glob/pattern) and Bash (paths inside the command).
+// Zero tokens for anything without scoped notes; each note is injected once per session.
 import path from 'node:path';
-import { openAll, stores, dirs, pathNotes, shortId, estTokens, seenLoad, seenAdd, readStdinJson } from './lib.mjs';
+import { openAll, stores, dirs, pathNotesFor, pathsInCommand, shortId, estTokens, seenLoad, seenAdd, readStdinJson } from './lib.mjs';
 
 const MAX_NOTES = Number(process.env.LEAN_MEMORY_PATH_NOTES) || 5;
 const MAX_TOKENS = Number(process.env.LEAN_MEMORY_PATH_TOKENS) || 400;
 
 const input = await readStdinJson();
-const file = input.tool_input?.file_path || input.tool_input?.notebook_path || input.tool_input?.path;
-if (!file) process.exit(0);
+const ti = input.tool_input || {};
+const root = dirs(input.cwd).root;
+const rel = (f) => { const r = path.relative(root, path.resolve(input.cwd || process.cwd(), f)).split(path.sep).join('/'); return r && !r.startsWith('..') ? r : ''; };
+
+let candidates = [];
+if (input.tool_name === 'Bash') candidates = pathsInCommand(ti.command || '', root);
+else {
+  for (const f of [ti.file_path, ti.notebook_path, ti.path]) if (f) candidates.push(rel(f));
+  for (const g of [ti.glob, ti.pattern]) if (typeof g === 'string' && input.tool_name === 'Glob' && /[\/.]/.test(g)) candidates.push(g.replace(/^\.?\//, '').split(/[*?]/)[0].replace(/\/+$/, ''));
+}
+candidates = [...new Set(candidates.filter(Boolean))];
+if (!candidates.length) process.exit(0);
+
 const all = openAll(input.cwd);
 if (!stores(all).length) process.exit(0);
 
-const rel = path.relative(dirs(input.cwd).root, path.resolve(input.cwd || process.cwd(), file)).split(path.sep).join('/');
-if (!rel || rel.startsWith('..')) process.exit(0);
-
 const seen = seenLoad(input.session_id);
-const notes = pathNotes(all, rel).filter((e) => !seen.includes(shortId(e))).slice(0, MAX_NOTES);
-let out = `[memory: notes for ${rel}]`;
+const notes = pathNotesFor(all, candidates).filter((e) => !seen.includes(shortId(e))).slice(0, MAX_NOTES);
+let out = `[memory: notes for ${candidates[0]}${candidates.length > 1 ? ' +' + (candidates.length - 1) : ''}]`;
 const used = [];
 for (const e of notes) {
   const line = `\n${shortId(e)} ${e.title}: ${e.body}`;
