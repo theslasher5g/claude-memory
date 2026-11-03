@@ -234,9 +234,9 @@ export function rank(e, now = Date.now()) {
 }
 const byRank = (a, b) => rank(b) - rank(a) || a.title.localeCompare(b.title) || a.id.localeCompare(b.id);
 
-export function topicCounts(all) {
+export function topicCounts(all, { includeScoped = false } = {}) {
   const m = new Map();
-  for (const s of stores(all)) for (const r of s.db.prepare("SELECT topic, COUNT(*) c FROM notes WHERE paths='' GROUP BY topic").all()) m.set(r.topic, (m.get(r.topic) || 0) + r.c);
+  for (const s of stores(all)) for (const r of s.db.prepare(`SELECT topic, COUNT(*) c FROM notes ${includeScoped ? '' : "WHERE paths=''"} GROUP BY topic`).all()) m.set(r.topic, (m.get(r.topic) || 0) + r.c);
   return [...m].sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]));
 }
 

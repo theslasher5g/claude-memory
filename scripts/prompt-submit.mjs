@@ -15,8 +15,9 @@ if (!stores(all).length) process.exit(0);
 const seen = seenLoad(input.session_id);
 const hits = search(all, prompt, { limit: 10 })
   .filter((r) => !seen.includes(shortId(r.e)))
-  // strong-match gate: >= half of the query terms covered, and either 2+ terms or a single term found in title/tags
-  .filter((r) => r.coverage >= 0.5 && (r.matched >= 2 || (r.coverage === 1 && r.inTitle)))
+  // match gate for natural-language prompts: 3+ distinct terms, or 2 terms with one in the title/tags,
+  // or a short query fully covered with a title/tag hit
+  .filter((r) => r.matched >= 3 || (r.matched >= 2 && r.inTitle) || (r.coverage === 1 && r.inTitle))
   .slice(0, MAX_HITS);
 
 let out = '[memory: relevant notes]';

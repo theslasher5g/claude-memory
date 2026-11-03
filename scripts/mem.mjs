@@ -76,7 +76,7 @@ function run(cmd, pos, f) {
         .filter((e) => !f.type || e.type === f.type).sort((a, b) => rank(b) - rank(a)).slice(0, Number(f.limit) || 50);
       return es.length ? es.map((e) => fmt(e, false)).join('\n') : 'empty';
     }
-    case 'topics': { const t = topicCounts(all); return t.length ? t.map(([n, c]) => `${n}(${c})`).join(' ') : 'empty'; }
+    case 'topics': { const t = topicCounts(all, { includeScoped: true }); return t.length ? t.map(([n, c]) => `${n}(${c})`).join(' ') : 'empty'; }
     case 'forget': {
       if (!pos.length) die('usage: forget <id...>');
       return pos.map((ref) => { const t = resolve(all, ref); if (!t) return `${ref}: not found`; write(t.store, () => remove(t.store, t.e.id)); return `forgot ${ref}`; }).join('\n');

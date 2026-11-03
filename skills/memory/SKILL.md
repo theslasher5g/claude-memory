@@ -28,7 +28,7 @@ Rules:
 
 ## Maintain
 - `forget <id...>` remove outdated notes — do this as soon as you notice a note is wrong.
-- `pin <id>` keep a note always at the top of the index.
+- `pin <id>` keep an unscoped note always at the top of the index (no effect on path-scoped notes, they load by file).
 - `prune [--days 90] [--apply]` drop unused, old, unpinned notes. `stats` shows the session-start token cost.
 
 ## Persistence & git

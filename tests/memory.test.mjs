@@ -148,3 +148,19 @@ test('bootstrap hint: only in a git repo without notes, once notes exist it disa
   const q = spawnSync('node', [path.join(root, 'scripts/session-start.mjs')], { env: { ...process.env, CLAUDE_PROJECT_DIR: plain, LEAN_MEMORY_GLOBAL_DIR: path.join(plain, '_g') }, input: '{}', encoding: 'utf8', cwd: plain });
   assert.equal(q.stdout, '');
 });
+
+test('prompt hook finds notes for long natural-language prompts (3+ matched terms), stays silent on chatter', () => {
+  const { mem, sh } = repo();
+  mem('add', '--title', 'Three separate crates: build helpers explicitly', '--body', 'cargo build only builds main crate; helper crates need manifest-path', '--topic', 'build');
+  mem('add', '--title', 'Secrets only via stdin pipes', '--body', 'Passwords reach the rdp helper through stdin; never put credentials in argv or env', '--topic', 'security', '--paths', 'crates/rdp/**');
+  const q = (prompt) => sh('prompt-submit.mjs', [], JSON.stringify({ prompt, session_id: sid(), cwd: process.cwd() }));
+  assert.match(ctx(q('How do I build and test the whole project including the helper crates?')), /Three separate crates/);
+  assert.match(ctx(q('Add a password field to the RDP connection, how should the credentials be passed?')), /stdin pipes/);
+  assert.equal(q('Make the host list scroll smoother when there are many entries').stdout, '');
+});
+
+test('topics counts path-scoped notes too', () => {
+  const { mem } = repo();
+  mem('add', '--title', 'Scoped only topic note', '--body', 'zebra body unique', '--topic', 'security', '--paths', 'src/**');
+  assert.match(mem('topics').stdout, /security\(1\)/);
+});
