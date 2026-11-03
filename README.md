@@ -1,25 +1,34 @@
 # lean-memory – token-effizientes Gedächtnis für Claude Code
 
-Ziel: Claude erinnert sich an Entscheidungen, Stolperfallen und Präferenzen, **ohne** dass bei jeder Session ein großer Memory-Block geladen wird.
+Ziel: Claude erinnert sich an Entscheidungen, Stolperfallen und Präferenzen, **ohne** dass pro Session ein großer Memory-Block geladen wird – auch bei sehr großen Projekten.
 
-## Architektur: progressive Offenlegung in 3 Stufen
+**Voraussetzung:** Node ≥ 22.5 (nutzt das eingebaute `node:sqlite`, keine npm-Pakete).
+
+## Architektur: progressive Offenlegung
 
 | Stufe | Wann | Was | Kosten |
 |---|---|---|---|
-| 1. Index | SessionStart (auch nach `/clear`, `/compact`) | nur Titel, gerankt (pinned > aktuell > oft genutzt), hartes Budget (Standard 500 Tokens) | ~100–500 Tokens, konstant – egal wie viele Notizen existieren |
-| 2. Auto-Recall | UserPromptSubmit | max. 3 Notizen, nur bei **starkem** BM25-Treffer, pro Session nie doppelt, Cap 250 Tokens | 0 Tokens bei schwachem Treffer |
-| 3. Abruf | on demand (`search` → `get <id>`) | kurze Snippets, dann Volltext nur der benötigten IDs | nur was gebraucht wird |
+| 1. Index | SessionStart (auch nach `/clear`, `/compact`) | Klein: Titel. Groß: angepinnte Titel + **Themenübersicht** `billing(23) auth(14)…` + Top-Titel. Hartes Budget (500 Tokens) | konstant, unabhängig von der Notizanzahl |
+| 2. Pfad-Notizen | PreToolUse auf Read/Edit/Write | Notizen mit `--paths` laden nur, wenn eine passende Datei angefasst wird; einmal pro Session | 0 Tokens in anderen Bereichen |
+| 3. Auto-Recall | UserPromptSubmit | max. 3 Notizen, nur bei starkem BM25-Treffer, nie doppelt, Cap 250 Tokens | 0 bei schwachem Treffer |
+| 4. Abruf | on demand | `search [--topic t]` → Snippets, `get <id>` → Volltext | nur was gebraucht wird |
 
-Weitere Sparhebel:
-- **Atomare Notizen mit Hard-Limits** (Titel ≤ 80, Body ≤ 500 Zeichen) – zu lange Notizen werden abgelehnt, Claude muss verdichten.
-- **Dedupe/Supersede**: ähnliche Notizen werden zusammengeführt (`--supersede <id>` für gezieltes Ersetzen), kein Wildwuchs.
-- **Ranking mit Decay**: Neues und Genutztes bleibt im Index, Altes fällt raus; `prune` entfernt ungenutzte Altlasten.
-- **Terse CLI-Ausgabe**: keine Prosa, keine JSON-Hüllen.
-- **Zero Dependencies**: nur Node ≥ 18, lokale Suche (BM25, DE/EN-Stopwörter), kein Embedding-/API-Aufruf.
+## Performance bei großen Beständen
+- **SQLite (WAL) + FTS5/BM25** statt JSONL: Suche, Dedupe-Kandidaten und Zähler laufen indexbasiert. Gemessen mit 20.000 Notizen: Sessionstart-Hook ≈ 120 ms, Prompt-/Pfad-Hook ≈ 80–100 ms (der Großteil ist Node-Start), Index bleibt bei ≈ 490 Tokens.
+- **Trefferzähler sind kleine In-place-Updates** (nur `get` zählt, nicht bloßes Anzeigen) – kein Neuschreiben der Datei, keine verlorenen Updates bei parallelen Sessions (Transaktionen, `busy_timeout`).
+- **Hooks sind read-only und legen nichts an**, wenn noch keine Datenbank existiert.
+- **Stabiler Index:** Recency wird wochenweise gebucketet und Ties deterministisch sortiert, damit der Index von Session zu Session identisch bleibt (Prompt-Cache-freundlich).
+- Alte `memories.jsonl` werden beim ersten Zugriff automatisch importiert.
+
+## Weitere Sparhebel
+- Atomare Notizen mit Hard-Limits (Titel ≤ 80, Body ≤ 500 Zeichen).
+- Dedupe/Supersede: ähnliche Notizen werden zusammengeführt, `--supersede <id>` ersetzt gezielt.
+- `prune` entfernt alte, ungenutzte, nicht angepinnte Notizen.
+- Terse CLI-Ausgabe, deutsche + englische Stoppwörter.
 
 ## Speicherort
-- Projekt: `<projekt>/.claude/memory/memories.jsonl` (per git teilbar oder ignorieren)
-- Global (`--global`, z. B. Sprach-Präferenzen): `~/.claude/memory/memories.jsonl`
+- Projekt: `<projekt>/.claude/memory/memory.db` (in `.gitignore` aufnehmen oder bewusst teilen)
+- Global (`--global`): `~/.claude/memory/memory.db`
 - Überschreibbar: `LEAN_MEMORY_DIR`, `LEAN_MEMORY_GLOBAL_DIR`
 
 ## Installation
@@ -30,12 +39,13 @@ Weitere Sparhebel:
 
 ## Nutzung
 - `/lean-memory:remember <text>` · `/lean-memory:recall <query>` · `/lean-memory:forget <id>`
-- Claude nutzt das CLI selbstständig (siehe `skills/memory/SKILL.md`):
-  `node scripts/mem.mjs add|search|get|list|forget|pin|unpin|index|stats|prune`
-- `stats` zeigt die aktuellen Session-Start-Kosten in Tokens.
+- CLI (nutzt Claude selbst, siehe `skills/memory/SKILL.md`):
+  `node scripts/mem.mjs add|search|get|list|topics|forget|pin|unpin|index|stats|prune`
+- Beispiel Pfad-Scoping: `add --title "Rundung half-even" --body "…" --paths "src/billing/**" --topic billing`
+- `stats` zeigt Session-Start-Kosten in Tokens.
 
 ## Einstellungen (Env)
-`LEAN_MEMORY_INDEX_TOKENS` (500) · `LEAN_MEMORY_MAX_HITS` (3) · `LEAN_MEMORY_PROMPT_TOKENS` (250)
+`LEAN_MEMORY_INDEX_TOKENS` (500) · `LEAN_MEMORY_MAX_HITS` (3) · `LEAN_MEMORY_PROMPT_TOKENS` (250) · `LEAN_MEMORY_PATH_NOTES` (5) · `LEAN_MEMORY_PATH_TOKENS` (400)
 
 ## Tests
 `node --test tests/`

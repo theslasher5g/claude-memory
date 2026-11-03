@@ -1,8 +1,17 @@
-// lean-memory core: storage, search (BM25), index building. Zero dependencies.
+// lean-memory core on node:sqlite (FTS5/BM25). Zero npm dependencies, needs Node >= 22.5.
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import crypto from 'node:crypto';
+
+// node:sqlite prints an ExperimentalWarning on some Node versions; keep hook stderr clean.
+const _emit = process.emitWarning;
+process.emitWarning = (w, ...a) => {
+  const type = typeof a[0] === 'string' ? a[0] : a[0]?.type;
+  if (type === 'ExperimentalWarning' || w?.name === 'ExperimentalWarning') return;
+  return _emit.call(process, w, ...a);
+};
+const { DatabaseSync } = await import('node:sqlite');
 
 export const LIMITS = { title: 80, body: 500 };
 export const TYPES = ['decision', 'fact', 'pref', 'gotcha', 'todo'];
@@ -15,53 +24,140 @@ const STOP = new Set(('a an the and or but if of to in on at by for with from as
 
 export function tokenize(text) {
   return String(text).toLowerCase().normalize('NFKD').replace(/[̀-ͯ]/g, '')
-    .split(/[^\p{L}\p{N}_]+/u)
+    .split(/[^\p{L}\p{N}]+/u)
     .filter((t) => t.length > 1 && !STOP.has(t))
     .map((t) => (t.length > 6 ? t.slice(0, 6) : t)); // cheap stemming by truncation
 }
+const norm = (s) => tokenize(s).join(' ');
 
 export function dirs(cwd) {
   const project = process.env.CLAUDE_PROJECT_DIR || cwd || process.cwd();
   return {
+    root: project,
     project: process.env.LEAN_MEMORY_DIR || path.join(project, '.claude', 'memory'),
     global: process.env.LEAN_MEMORY_GLOBAL_DIR || process.env.CLAUDE_PLUGIN_DATA || path.join(os.homedir(), '.claude', 'memory'),
   };
 }
 
-const fileOf = (dir) => path.join(dir, 'memories.jsonl');
+const SCHEMA = `
+CREATE TABLE IF NOT EXISTS notes(
+  n INTEGER PRIMARY KEY AUTOINCREMENT, id TEXT UNIQUE NOT NULL,
+  type TEXT, title TEXT, body TEXT, tags TEXT DEFAULT '', topic TEXT DEFAULT 'misc', paths TEXT DEFAULT '',
+  created TEXT, updated TEXT, pinned INTEGER DEFAULT 0, hits INTEGER DEFAULT 0);
+CREATE INDEX IF NOT EXISTS notes_topic ON notes(topic);
+CREATE INDEX IF NOT EXISTS notes_paths ON notes(paths) WHERE paths != '';
+CREATE INDEX IF NOT EXISTS notes_updated ON notes(updated);
+CREATE VIRTUAL TABLE IF NOT EXISTS fts USING fts5(title, tags, body);`;
 
-export function load(dir, scope) {
-  let raw;
-  try { raw = fs.readFileSync(fileOf(dir), 'utf8'); } catch { return []; }
-  const out = [];
-  for (const line of raw.split('\n')) {
-    if (!line.trim()) continue;
-    try { const e = JSON.parse(line); e.scope = scope; out.push(e); } catch { /* skip corrupt line */ }
-  }
-  return out;
-}
-
-export function save(dir, entries) {
+/** Open a store. Read-only callers (hooks) pass create:false and get null when nothing exists yet. */
+export function openStore(dir, scope, { create = false } = {}) {
+  const file = path.join(dir, 'memory.db');
+  const legacy = path.join(dir, 'memories.jsonl');
+  if (!fs.existsSync(file) && !create && !fs.existsSync(legacy)) return null;
   fs.mkdirSync(dir, { recursive: true });
-  const tmp = fileOf(dir) + `.${process.pid}.tmp`;
-  fs.writeFileSync(tmp, entries.map(({ scope, ...e }) => JSON.stringify(e)).join('\n') + (entries.length ? '\n' : ''));
-  fs.renameSync(tmp, fileOf(dir));
+  const db = new DatabaseSync(file);
+  db.exec('PRAGMA busy_timeout=5000'); // must come first so concurrent first-time opens wait instead of failing
+  for (let attempt = 0; ; attempt++) {
+    try { db.exec('PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL;'); db.exec(SCHEMA); break; } catch (e) {
+      if (attempt >= 5 || !/locked|busy/i.test(String(e.message))) throw e;
+      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 50 * (attempt + 1));
+    }
+  }
+  const store = { db, scope, dir, file };
+  if (fs.existsSync(legacy)) migrate(store, legacy);
+  return store;
 }
 
-export function loadAll(cwd) {
+function migrate(store, legacy) {
+  try {
+    const rows = fs.readFileSync(legacy, 'utf8').split('\n').filter(Boolean).map((l) => { try { return JSON.parse(l); } catch { return null; } }).filter(Boolean);
+    tx(store.db, () => { for (const e of rows) if (!getById(store, e.id)) insert(store, { ...e, tags: e.tags || [], paths: [], topic: e.tags?.[0] }); });
+    fs.renameSync(legacy, legacy + '.migrated');
+  } catch { /* leave the legacy file untouched */ }
+}
+
+export function openAll(cwd, opts) {
   const d = dirs(cwd);
-  return { d, project: load(d.project, 'project'), global: load(d.global, 'global') };
+  return { d, project: openStore(d.project, 'project', opts), global: openStore(d.global, 'global', opts) };
 }
+export const stores = (all) => [all.project, all.global].filter(Boolean);
 
+function tx(db, fn) {
+  db.exec('BEGIN IMMEDIATE');
+  try { const r = fn(); db.exec('COMMIT'); return r; } catch (e) { db.exec('ROLLBACK'); throw e; }
+}
+export { tx };
+
+const toNote = (r, store) => r && ({ ...r, tags: r.tags ? r.tags.split(',') : [], paths: r.paths ? r.paths.split(',') : [], pinned: !!r.pinned, scope: store.scope });
 export const shortId = (e) => (e.scope === 'global' ? 'g-' : '') + e.id;
 
-export function findById(all, ref) {
-  const gl = ref.startsWith('g-');
-  const id = gl ? ref.slice(2) : ref;
-  return (gl ? all.global : all.project).find((e) => e.id === id);
+function ftsPut(db, n, e) {
+  db.prepare('DELETE FROM fts WHERE rowid=?').run(n);
+  db.prepare('INSERT INTO fts(rowid,title,tags,body) VALUES(?,?,?,?)').run(n, norm(e.title), norm((e.tags || []).join(' ')), norm(e.body));
 }
 
-const docTokens = (e) => [...tokenize(e.title), ...tokenize(e.title), ...tokenize((e.tags || []).join(' ')), ...tokenize((e.tags || []).join(' ')), ...tokenize(e.body)];
+export function insert(store, e) {
+  const now = new Date().toISOString();
+  const tags = e.tags || [];
+  const r = store.db.prepare('INSERT INTO notes(id,type,title,body,tags,topic,paths,created,updated,pinned,hits) VALUES(?,?,?,?,?,?,?,?,?,?,?)')
+    .run(e.id, e.type, e.title, e.body, tags.join(','), e.topic || tags[0] || 'misc', (e.paths || []).join(','), e.created || now, e.updated || now, e.pinned ? 1 : 0, e.hits || 0);
+  ftsPut(store.db, Number(r.lastInsertRowid), { ...e, tags });
+}
+
+export function update(store, id, patch) {
+  const cur = getById(store, id);
+  const e = { ...cur, ...patch, updated: new Date().toISOString() };
+  store.db.prepare('UPDATE notes SET type=?,title=?,body=?,tags=?,topic=?,paths=?,updated=?,pinned=? WHERE id=?')
+    .run(e.type, e.title, e.body, e.tags.join(','), e.topic || e.tags[0] || 'misc', e.paths.join(','), e.updated, e.pinned ? 1 : 0, id);
+  ftsPut(store.db, store.db.prepare('SELECT n FROM notes WHERE id=?').get(id).n, e);
+}
+
+export function remove(store, id) {
+  const r = store.db.prepare('SELECT n FROM notes WHERE id=?').get(id);
+  if (!r) return false;
+  store.db.prepare('DELETE FROM fts WHERE rowid=?').run(r.n);
+  store.db.prepare('DELETE FROM notes WHERE id=?').run(id);
+  return true;
+}
+
+export const getById = (store, id) => toNote(store.db.prepare('SELECT * FROM notes WHERE id=?').get(id), store);
+export const bumpHits = (store, id) => store.db.prepare('UPDATE notes SET hits=hits+1 WHERE id=?').run(id);
+
+export function resolve(all, ref) {
+  const gl = ref.startsWith('g-');
+  const store = gl ? all.global : all.project;
+  const e = store && getById(store, gl ? ref.slice(2) : ref);
+  return e ? { store, e } : null;
+}
+
+export function newId(store) {
+  let id;
+  do { id = crypto.randomBytes(3).toString('hex'); } while (getById(store, id));
+  return id;
+}
+
+const ftsQuery = (toks) => toks.map((t) => `"${t}"`).join(' OR ');
+
+/** BM25 search over FTS5 (title x3, tags x3, body x1). Returns coverage info for gating. */
+export function search(all, query, { limit = 5, topic } = {}) {
+  const q = [...new Set(tokenize(query))];
+  if (!q.length) return [];
+  const res = [];
+  for (const store of stores(all)) {
+    const rows = store.db.prepare(
+      `SELECT notes.*, bm25(fts,3,3,1) AS s FROM fts JOIN notes ON notes.n = fts.rowid
+       WHERE fts MATCH ? ${topic ? 'AND notes.topic = ?' : ''} ORDER BY s LIMIT ?`)
+      .all(...[ftsQuery(q), ...(topic ? [topic] : []), Math.max(limit, 10)]);
+    for (const r of rows) {
+      const e = toNote(r, store);
+      const head = new Set(tokenize(e.title + ' ' + e.tags.join(' ')));
+      const all_ = new Set([...head, ...tokenize(e.body)]);
+      const matched = q.filter((t) => all_.has(t)).length;
+      res.push({ e, score: -r.s, matched, coverage: matched / q.length, inTitle: q.some((t) => head.has(t)) });
+    }
+  }
+  return res.sort((a, b) => b.score - a.score).slice(0, limit);
+}
 
 function jaccard(a, b) {
   const A = new Set(a), B = new Set(b);
@@ -69,65 +165,106 @@ function jaccard(a, b) {
   return A.size + B.size - i === 0 ? 0 : i / (A.size + B.size - i);
 }
 
-export function findSimilar(entries, title, body) {
+/** Dedupe: FTS finds a few candidates (O(log N)), Jaccard decides. */
+export function findSimilar(store, title, body) {
   const t = [...tokenize(title), ...tokenize(body)];
-  let best = null, bestScore = 0;
-  for (const e of entries) {
-    const s = jaccard(t, [...tokenize(e.title), ...tokenize(e.body)]);
-    if (s > bestScore) { best = e; bestScore = s; }
+  if (!t.length) return null;
+  const rows = store.db.prepare('SELECT notes.* FROM fts JOIN notes ON notes.n = fts.rowid WHERE fts MATCH ? ORDER BY bm25(fts,3,3,1) LIMIT 8').all(ftsQuery([...new Set(t)]));
+  let best = null, bs = 0;
+  for (const r of rows) {
+    const s = jaccard(t, [...tokenize(r.title), ...tokenize(r.body)]);
+    if (s > bs) { best = r; bs = s; }
   }
-  return bestScore >= 0.75 ? best : null;
+  return bs >= 0.75 ? toNote(best, store) : null;
 }
 
-export function search(entries, query, { limit = 5 } = {}) {
-  const q = [...new Set(tokenize(query))];
-  if (!q.length || !entries.length) return [];
-  const docs = entries.map((e) => ({ e, toks: docTokens(e) }));
-  const avg = docs.reduce((n, d) => n + d.toks.length, 0) / docs.length || 1;
-  const df = new Map();
-  for (const d of docs) for (const t of new Set(d.toks)) df.set(t, (df.get(t) || 0) + 1);
-  const N = docs.length, k1 = 1.2, b = 0.75;
-  const res = [];
-  for (const { e, toks } of docs) {
-    const tf = new Map();
-    for (const t of toks) tf.set(t, (tf.get(t) || 0) + 1);
-    let score = 0, matched = 0;
-    for (const t of q) {
-      const f = tf.get(t); if (!f) continue;
-      matched++;
-      const idf = Math.log(1 + (N - df.get(t) + 0.5) / (df.get(t) + 0.5));
-      score += idf * ((f * (k1 + 1)) / (f + k1 * (1 - b + (b * toks.length) / avg)));
-    }
-    if (matched) res.push({ e, score, coverage: matched / q.length, matched });
-  }
-  return res.sort((x, y) => y.score - x.score).slice(0, limit);
-}
-
-// Importance for the always-loaded index: pinned > recent > frequently used.
+/** Importance for the index. Recency is bucketed per week so the index stays byte-stable (prompt-cache friendly). */
 export function rank(e, now = Date.now()) {
-  const ageDays = Math.max(0, (now - Date.parse(e.updated || e.created || 0)) / 864e5);
-  return (e.pinned ? 1000 : 0) + 10 / (1 + ageDays / 30) + 2 * Math.log2(1 + (e.hits || 0)) + (e.type === 'pref' || e.type === 'gotcha' ? 1 : 0);
+  const weeks = Math.floor(Math.max(0, (now - Date.parse(e.updated || e.created || 0)) / 864e5) / 7);
+  return (e.pinned ? 1000 : 0) + 10 / (1 + (weeks * 7) / 30) + 2 * Math.log2(1 + (e.hits || 0)) + (e.type === 'pref' || e.type === 'gotcha' ? 1 : 0);
+}
+const byRank = (a, b) => rank(b) - rank(a) || a.title.localeCompare(b.title) || a.id.localeCompare(b.id);
+
+export function topicCounts(all) {
+  const m = new Map();
+  for (const s of stores(all)) for (const r of s.db.prepare("SELECT topic, COUNT(*) c FROM notes WHERE paths='' GROUP BY topic").all()) m.set(r.topic, (m.get(r.topic) || 0) + r.c);
+  return [...m].sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]));
 }
 
+const count = (all, where) => stores(all).reduce((n, s) => n + s.db.prepare(`SELECT COUNT(*) c FROM notes ${where}`).get().c, 0);
+
+/**
+ * Adaptive index: flat titles while everything fits the budget; otherwise
+ * pinned titles + topic overview + top-ranked titles. Path-scoped notes never appear here (they auto-load on file access).
+ */
 export function buildIndex(all, scriptPath, { budgetTokens = Number(process.env.LEAN_MEMORY_INDEX_TOKENS) || 500 } = {}) {
-  const entries = [...all.project, ...all.global].sort((a, b) => rank(b) - rank(a));
-  const head = `[memory] ${entries.length} notes (titles only). Details: node "${scriptPath}" get <id> | search <query>. ` +
-    `Save: node "${scriptPath}" add --type decision|fact|pref|gotcha --title "<=${LIMITS.title}ch" --body "<=${LIMITS.body}ch" [--tags a,b] [--global]. ` +
-    `Save only durable, non-obvious facts not derivable from code; reuse existing notes instead of duplicating.`;
+  const total = count(all, ''), scoped = count(all, "WHERE paths != ''");
+  const head = `[memory] ${total} notes. Details: node "${scriptPath}" get <id> | search <query> [--topic t]. ` +
+    `Save: node "${scriptPath}" add --type decision|fact|pref|gotcha --title "<=${LIMITS.title}ch" --body "<=${LIMITS.body}ch" [--tags a,b] [--topic t] [--paths globs] [--global]. ` +
+    `Save only durable, non-obvious facts not derivable from code; reuse existing notes instead of duplicating.` +
+    (scoped ? `\n${scoped} path-scoped notes load automatically when matching files are read/edited.` : '');
   let budget = budgetTokens * 4 - head.length;
+  const line = (e) => `${shortId(e)} ${e.type[0]}${e.pinned ? '*' : ''} ${e.title}`;
+  const fetch = (sql, ...p) => stores(all).flatMap((s) => s.db.prepare(sql).all(...p).map((r) => toNote(r, s)));
+
+  const pinned = fetch("SELECT * FROM notes WHERE pinned=1 AND paths=''").sort(byRank);
   const lines = [];
-  let shown = 0;
-  for (const e of entries) {
-    const line = `${shortId(e)} ${e.type[0]}${e.pinned ? '*' : ''} ${e.title}`;
-    if (budget - line.length - 1 < 40) break;
-    lines.push(line); budget -= line.length + 1; shown++;
+  const take = (e) => { const l = line(e); if (budget - l.length - 1 < 40) return false; lines.push(l); budget -= l.length + 1; return true; };
+  pinned.forEach(take);
+
+  const unpinnedCount = total - scoped - pinned.length;
+  let rest;
+  if (unpinnedCount <= 300) rest = fetch("SELECT * FROM notes WHERE pinned=0 AND paths=''").sort(byRank);
+  else rest = fetch("SELECT * FROM (SELECT * FROM notes WHERE pinned=0 AND paths='' ORDER BY updated DESC LIMIT 150) UNION SELECT * FROM (SELECT * FROM notes WHERE pinned=0 AND paths='' ORDER BY hits DESC LIMIT 150)").sort(byRank);
+
+  const fitsAll = rest.length === unpinnedCount && rest.reduce((n, e) => n + line(e).length + 1, 0) <= budget - 40;
+  let topicLine = '';
+  if (!fitsAll) {
+    const topics = topicCounts(all);
+    let t = 'topics (search --topic <t>):';
+    for (const [name, c] of topics) { const part = ` ${name}(${c})`; if (t.length + part.length > budget * 0.4) { t += ' …'; break; } t += part; }
+    topicLine = t; budget -= t.length + 1;
   }
-  const more = entries.length - shown;
-  return head + (lines.length ? '\n' + lines.join('\n') : '') + (more > 0 ? `\n(+${more} more, use search)` : '');
+  let shown = 0;
+  const body = [];
+  for (const e of rest) { const l = line(e); if (budget - l.length - 1 < 40) break; body.push(l); budget -= l.length + 1; shown++; }
+  const out = [head, ...lines, ...(topicLine ? [topicLine] : []), ...body];
+  const more = unpinnedCount - shown;
+  if (more > 0) out.push(`(+${more} more, use search)`);
+  return out.join('\n');
 }
 
-export function newId(existing) {
-  let id;
-  do { id = crypto.randomBytes(3).toString('hex'); } while (existing.some((e) => e.id === id));
-  return id;
+// ---- path scoping ----
+export function globToRegex(g) {
+  g = g.trim().replace(/^\.?\//, '');
+  if (g.endsWith('/')) g += '**';
+  let re = '';
+  for (let i = 0; i < g.length; i++) {
+    const c = g[i];
+    if (c === '*') {
+      if (g[i + 1] === '*') { i++; if (g[i + 1] === '/') { i++; re += '(?:.*/)?'; } else re += '.*'; } else re += '[^/]*';
+    } else if (c === '?') re += '[^/]';
+    else re += c.replace(/[.+^${}()|[\]\\]/g, '\\$&');
+  }
+  return new RegExp('^' + re + '$');
+}
+
+export function pathNotes(all, relPath) {
+  const out = [];
+  for (const s of stores(all)) {
+    for (const r of s.db.prepare("SELECT * FROM notes WHERE paths != ''").all()) {
+      const e = toNote(r, s);
+      if (e.paths.some((p) => globToRegex(p).test(relPath))) out.push(e);
+    }
+  }
+  return out.sort(byRank);
+}
+
+// ---- per-session "already injected" list shared by all hooks ----
+const seenFile = (sid) => path.join(os.tmpdir(), `lean-memory-${String(sid || 'x').replace(/\W/g, '')}.json`);
+export function seenLoad(sid) { try { return JSON.parse(fs.readFileSync(seenFile(sid), 'utf8')); } catch { return []; } }
+export function seenAdd(sid, ids) { try { fs.writeFileSync(seenFile(sid), JSON.stringify([...new Set([...seenLoad(sid), ...ids])])); } catch { /* best effort */ } }
+
+export async function readStdinJson() {
+  try { return JSON.parse(await new Promise((r) => { let s = ''; process.stdin.on('data', (c) => (s += c)); process.stdin.on('end', () => r(s || '{}')); })); } catch { return {}; }
 }

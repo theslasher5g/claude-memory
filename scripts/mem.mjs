@@ -1,28 +1,32 @@
 #!/usr/bin/env node
 // lean-memory CLI. Output is deliberately terse: every byte printed costs tokens.
-import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { LIMITS, TYPES, estTokens, loadAll, save, search, findById, findSimilar, newId, buildIndex, shortId, rank } from './lib.mjs';
+import {
+  LIMITS, TYPES, estTokens, openAll, stores, tx, search, findSimilar, newId, buildIndex, shortId, rank,
+  insert, update, remove, getById, bumpHits, resolve, topicCounts,
+} from './lib.mjs';
 
 const SELF = fileURLToPath(import.meta.url);
-const BOOL = new Set(['pin', 'unpin', 'global', 'apply', 'full']);
+const BOOL = new Set(['pin', 'global', 'apply', 'full']);
 
 function parse(argv) {
   const flags = {}, pos = [];
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
-    if (a.startsWith('--')) {
-      const k = a.slice(2);
-      if (BOOL.has(k)) flags[k] = true; else flags[k] = argv[++i];
-    } else pos.push(a);
+    if (a.startsWith('--')) { const k = a.slice(2); flags[k] = BOOL.has(k) ? true : argv[++i]; } else pos.push(a);
   }
   return { flags, pos };
 }
 
 const clean = (s) => String(s ?? '').replace(/\s+/g, ' ').trim();
+const list = (s) => clean(s).split(/[ ,]+/).filter(Boolean);
 const die = (m) => { console.error(m); process.exit(1); };
-const bucket = (all, e) => (e.scope === 'global' ? all.global : all.project);
-const persist = (all) => { save(all.d.project, all.project); save(all.d.global, all.global); };
+
+function fmt(e, full) {
+  const head = `${shortId(e)} [${e.type}] ${e.title}`;
+  if (full) return `${head}\n${e.body}${e.tags.length ? `\n#${e.tags.join(' #')}` : ''}${e.paths.length ? `\npaths: ${e.paths.join(', ')}` : ''}`;
+  return e.body ? `${head} — ${e.body.length > 140 ? e.body.slice(0, 137) + '...' : e.body}` : head;
+}
 
 function cmdAdd(all, f) {
   const type = f.type || 'fact', title = clean(f.title), body = clean(f.body);
@@ -30,71 +34,77 @@ function cmdAdd(all, f) {
   if (!title) die('--title required');
   if (title.length > LIMITS.title) die(`title ${title.length}ch > ${LIMITS.title}; condense`);
   if (body.length > LIMITS.body) die(`body ${body.length}ch > ${LIMITS.body}; condense or split into atomic notes`);
-  const scope = f.global ? 'global' : 'project';
-  const list = all[scope];
-  const now = new Date().toISOString();
-  const tags = clean(f.tags).split(/[ ,]+/).filter(Boolean);
-  const target = f.supersede ? findById(all, f.supersede) : findSimilar(list, title, body);
+  const store = f.global ? all.global : all.project;
+  const tags = list(f.tags), paths = clean(f.paths).split(',').map((s) => s.trim()).filter(Boolean);
+  const topic = f.topic ? clean(f.topic).toLowerCase() : undefined;
+  const target = f.supersede ? resolve(all, f.supersede) : (() => { const e = findSimilar(store, title, body); return e && { store, e }; })();
   if (target) {
-    Object.assign(target, { type, title, body, tags: tags.length ? tags : target.tags, updated: now, pinned: f.pin ? true : target.pinned });
-    persist(all);
-    return `updated ${shortId(target)}`;
+    const patch = { type, title, body, tags: tags.length ? tags : target.e.tags, paths: paths.length ? paths : target.e.paths, pinned: f.pin ? true : target.e.pinned };
+    if (topic) patch.topic = topic;
+    tx(target.store.db, () => update(target.store, target.e.id, patch));
+    return `updated ${shortId(target.e)}`;
   }
-  const e = { id: newId(list), type, title, body, tags, created: now, updated: now, hits: 0, pinned: !!f.pin, scope };
-  list.push(e); persist(all);
+  const e = { id: newId(store), type, title, body, tags, topic, paths, pinned: !!f.pin, scope: store.scope };
+  tx(store.db, () => insert(store, e));
   return `saved ${shortId(e)}`;
 }
 
-function fmt(e, full) {
-  const head = `${shortId(e)} [${e.type}] ${e.title}`;
-  if (full) return `${head}\n${e.body}${e.tags?.length ? `\n#${e.tags.join(' #')}` : ''}`;
-  return e.body ? `${head} — ${e.body.length > 140 ? e.body.slice(0, 137) + '...' : e.body}` : head;
+function every(all, sql, params = []) {
+  return stores(all).flatMap((s) => s.db.prepare(sql).all(...params).map((r) => getById(s, r.id)));
 }
 
 function run(cmd, pos, f) {
-  const all = loadAll(process.cwd());
-  const everything = () => [...all.project, ...all.global];
+  const all = openAll(process.cwd(), { create: cmd === 'add' });
+  if (cmd === 'add') {
+    return cmdAdd(all, f);
+  }
+  if (!stores(all).length && !['index', 'stats', 'topics', 'list', 'search', undefined].includes(cmd)) return 'empty';
   switch (cmd) {
-    case 'add': return cmdAdd(all, f);
     case 'search': {
-      const res = search(everything(), pos.join(' '), { limit: Number(f.limit) || 5 });
-      if (!res.length) return 'no match';
-      res.forEach((r) => { r.e.hits = (r.e.hits || 0) + 1; }); persist(all);
-      return res.map((r) => fmt(r.e, f.full)).join('\n');
+      const res = search(all, pos.join(' '), { limit: Number(f.limit) || 5, topic: f.topic });
+      return res.length ? res.map((r) => fmt(r.e, f.full)).join('\n') : 'no match';
     }
     case 'get': {
       if (!pos.length) die('usage: get <id...>');
-      const out = pos.map((id) => { const e = findById(all, id); if (e) e.hits = (e.hits || 0) + 1; return e ? fmt(e, true) : `${id}: not found`; });
-      persist(all); return out.join('\n');
+      return pos.map((ref) => {
+        const t = resolve(all, ref); if (!t) return `${ref}: not found`;
+        bumpHits(t.store, t.e.id); return fmt(t.e, true);
+      }).join('\n');
     }
     case 'list': {
-      const es = everything().filter((e) => !f.type || e.type === f.type).sort((a, b) => rank(b) - rank(a));
+      const es = every(all, f.topic ? 'SELECT id FROM notes WHERE topic=?' : 'SELECT id FROM notes', f.topic ? [f.topic] : [])
+        .filter((e) => !f.type || e.type === f.type).sort((a, b) => rank(b) - rank(a)).slice(0, Number(f.limit) || 50);
       return es.length ? es.map((e) => fmt(e, false)).join('\n') : 'empty';
     }
+    case 'topics': { const t = topicCounts(all); return t.length ? t.map(([n, c]) => `${n}(${c})`).join(' ') : 'empty'; }
     case 'forget': {
       if (!pos.length) die('usage: forget <id...>');
-      return pos.map((id) => {
-        const e = findById(all, id); if (!e) return `${id}: not found`;
-        const b = bucket(all, e); b.splice(b.indexOf(e), 1); return `forgot ${id}`;
-      }).join('\n') + (persist(all), '');
+      return pos.map((ref) => { const t = resolve(all, ref); if (!t) return `${ref}: not found`; tx(t.store.db, () => remove(t.store, t.e.id)); return `forgot ${ref}`; }).join('\n');
     }
     case 'pin': case 'unpin': {
-      return pos.map((id) => { const e = findById(all, id); if (!e) return `${id}: not found`; e.pinned = cmd === 'pin'; return `${cmd}ned ${id}`; }).join('\n') + (persist(all), '');
+      return pos.map((ref) => {
+        const t = resolve(all, ref); if (!t) return `${ref}: not found`;
+        tx(t.store.db, () => update(t.store, t.e.id, { pinned: cmd === 'pin' })); return `${cmd}ned ${ref}`;
+      }).join('\n');
     }
     case 'index': return buildIndex(all, SELF);
     case 'stats': {
-      const idx = buildIndex(all, SELF);
-      return `project ${all.project.length}, global ${all.global.length}; session-start cost ≈ ${estTokens(idx)} tokens\n${all.d.project}\n${all.d.global}`;
+      const n = (s) => (s ? s.db.prepare('SELECT COUNT(*) c FROM notes').get().c : 0);
+      const sc = stores(all).reduce((a, s) => a + s.db.prepare("SELECT COUNT(*) c FROM notes WHERE paths!=''").get().c, 0);
+      return `project ${n(all.project)}, global ${n(all.global)} (${sc} path-scoped); session-start cost ≈ ${estTokens(buildIndex(all, SELF))} tokens\n${all.d.project}\n${all.d.global}`;
     }
     case 'prune': {
-      const days = Number(f.days) || 90, cutoff = Date.now() - days * 864e5;
-      const stale = everything().filter((e) => !e.pinned && !(e.hits > 0) && Date.parse(e.updated || e.created) < cutoff);
-      if (!f.apply) return stale.length ? `would remove ${stale.length} (unused, >${days}d, unpinned; add --apply):\n` + stale.map((e) => fmt(e)).join('\n') : 'nothing to prune';
-      stale.forEach((e) => { const b = bucket(all, e); b.splice(b.indexOf(e), 1); });
-      persist(all); return `removed ${stale.length}`;
+      const days = Number(f.days) || 90, cutoff = new Date(Date.now() - days * 864e5).toISOString();
+      const stale = [];
+      for (const s of stores(all)) for (const r of s.db.prepare('SELECT id FROM notes WHERE pinned=0 AND hits=0 AND updated<?').all(cutoff)) stale.push({ s, e: getById(s, r.id) });
+      if (!f.apply) return stale.length ? `would remove ${stale.length} (unused, >${days}d, unpinned; add --apply):\n` + stale.map((x) => fmt(x.e)).join('\n') : 'nothing to prune';
+      for (const { s, e } of stale) tx(s.db, () => remove(s, e.id));
+      return `removed ${stale.length}`;
     }
     default:
-      return 'usage: add|search|get|list|forget|pin|unpin|index|stats|prune\n  add --type T --title "" --body "" [--tags a,b] [--global] [--pin] [--supersede id]\n  search <query> [--limit N] [--full]\n  get <id...> | forget <id...> | prune [--days N] [--apply]';
+      return 'usage: add|search|get|list|topics|forget|pin|unpin|index|stats|prune\n' +
+        '  add --type T --title "" --body "" [--tags a,b] [--topic t] [--paths "src/x/**,docs/y.md"] [--global] [--pin] [--supersede id]\n' +
+        '  search <query> [--topic t] [--limit N] [--full] | get <id...> | list [--topic t] [--type T]\n  forget <id...> | prune [--days N] [--apply]';
   }
 }
 

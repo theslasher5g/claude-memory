@@ -10,18 +10,21 @@ CLI: `node "${CLAUDE_PLUGIN_ROOT}/scripts/mem.mjs" <cmd>`
 The session-start index lists note titles only. Never load everything: **search, then get**.
 
 ## Recall
+- `topics` → topic overview with counts; `search <query> --topic t` narrows large stores.
 - `search <query>` → top 5 as `id [type] title — snippet` (cheap). Add `--full` only if needed.
 - `get <id...>` → full body of the notes you actually need.
 
 ## Save (atomic, short)
-`add --type decision|fact|pref|gotcha|todo --title "<=80 chars" --body "<=500 chars" [--tags a,b] [--global] [--pin]`
+`add --type decision|fact|pref|gotcha|todo --title "<=80 chars" --body "<=500 chars" [--tags a,b] [--topic t] [--paths "src/x/**,docs/y.md"] [--global] [--pin]`
 
 Rules:
 1. One fact per note. Title = the claim, body = the why / how to apply.
 2. Save only what is durable, non-obvious and **not derivable from code, git log or docs**.
 3. Similar notes are merged automatically; to replace a specific one use `--supersede <id>`.
-4. User-wide preferences → `--global`; project knowledge → default (project).
-5. Never store secrets, tokens or credentials.
+4. Note applies to one area of the repo? Add `--paths` (globs, comma-separated, no braces). Such notes are hidden from the index and load automatically (once per session) when a matching file is read/edited — prefer this over a global note for anything area-specific.
+5. Set `--topic` (default: first tag) so the topic overview stays meaningful.
+6. User-wide preferences → `--global`; project knowledge → default (project).
+7. Never store secrets, tokens or credentials.
 
 ## Maintain
 - `forget <id...>` remove outdated notes — do this as soon as you notice a note is wrong.
