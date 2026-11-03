@@ -1,58 +1,59 @@
-# lean-memory – token-effizientes Gedächtnis für Claude Code
+# lean-memory – token-efficient memory for Claude Code
 
-Ziel: Claude erinnert sich an Entscheidungen, Stolperfallen und Präferenzen, **ohne** dass pro Session ein großer Memory-Block geladen wird – auch bei sehr großen Projekten.
+Goal: Claude remembers decisions, gotchas and preferences **without** loading a large memory block every session – even in very large projects.
 
-**Voraussetzung:** Node ≥ 22.5 (nutzt das eingebaute `node:sqlite`, keine npm-Pakete).
+**Requirement:** Node ≥ 22.5 (uses the built-in `node:sqlite`, no npm packages).
 
-## Architektur: progressive Offenlegung
+## Architecture: progressive disclosure
 
-| Stufe | Wann | Was | Kosten |
+| Tier | When | What | Cost |
 |---|---|---|---|
-| 1. Index | SessionStart (auch nach `/clear`, `/compact`) | Klein: Titel. Groß: angepinnte Titel + **Themenübersicht** `billing(23) auth(14)…` + Top-Titel. Hartes Budget (500 Tokens) | konstant, unabhängig von der Notizanzahl |
-| 2. Pfad-Notizen | PreToolUse auf Read/Edit/Write | Notizen mit `--paths` laden nur, wenn eine passende Datei angefasst wird; einmal pro Session | 0 Tokens in anderen Bereichen |
-| 3. Auto-Recall | UserPromptSubmit | max. 3 Notizen, nur bei starkem BM25-Treffer, nie doppelt, Cap 250 Tokens | 0 bei schwachem Treffer |
-| 4. Abruf | on demand | `search [--topic t]` → Snippets, `get <id>` → Volltext | nur was gebraucht wird |
+| 1. Index | SessionStart (also after `/clear`, `/compact`) | Small stores: titles. Large stores: pinned titles + **topic overview** `billing(23) auth(14)…` + top titles. Hard budget (500 tokens) | constant, independent of the number of notes |
+| 2. Path notes | PreToolUse on Read/Edit/Write | Notes with `--paths` load only when a matching file is touched; once per session | 0 tokens elsewhere |
+| 3. Auto-recall | UserPromptSubmit | max. 3 notes, only on a strong BM25 match, never twice, 250-token cap | 0 on a weak match |
+| 4. Lookup | on demand | `search [--topic t]` → snippets, `get <id>` → full text | only what is needed |
 
-## Performance bei großen Beständen
-- **SQLite (WAL) + FTS5/BM25** statt JSONL: Suche, Dedupe-Kandidaten und Zähler laufen indexbasiert. Gemessen mit 20.000 Notizen: Sessionstart-Hook ≈ 120 ms, Prompt-/Pfad-Hook ≈ 80–100 ms (der Großteil ist Node-Start), Index bleibt bei ≈ 490 Tokens.
-- **Trefferzähler sind kleine In-place-Updates** (nur `get` zählt, nicht bloßes Anzeigen) – kein Neuschreiben der Datei, keine verlorenen Updates bei parallelen Sessions (Transaktionen, `busy_timeout`).
-- **Hooks sind read-only und legen nichts an**, wenn noch keine Datenbank existiert.
-- **Stabiler Index:** Recency wird wochenweise gebucketet und Ties deterministisch sortiert, damit der Index von Session zu Session identisch bleibt (Prompt-Cache-freundlich).
-- Alte `memories.jsonl` werden beim ersten Zugriff automatisch importiert.
+## Performance with large stores
+- **SQLite (WAL) + FTS5/BM25** instead of JSONL: search, dedupe candidates and counters are index-based. Measured with 20,000 notes: SessionStart hook ≈ 120 ms, prompt/path hooks ≈ 80–100 ms (mostly Node startup), index stays at ≈ 490 tokens.
+- **Hit counters are small in-place updates** (only `get` counts, merely being shown does not) – no file rewrites, no lost updates with parallel sessions (transactions, `busy_timeout`).
+- **Hooks are read-only and create nothing** if no database exists yet.
+- **Stable index:** recency is bucketed per week and ties are sorted deterministically, so the index is identical from session to session (prompt-cache friendly).
+- An old `memories.jsonl` is imported automatically on first access.
 
-## Weitere Sparhebel
-- Atomare Notizen mit Hard-Limits (Titel ≤ 80, Body ≤ 500 Zeichen).
-- Dedupe/Supersede: ähnliche Notizen werden zusammengeführt, `--supersede <id>` ersetzt gezielt.
-- `prune` entfernt alte, ungenutzte, nicht angepinnte Notizen.
-- Terse CLI-Ausgabe, deutsche + englische Stoppwörter.
+## More savings
+- Atomic notes with hard limits (title ≤ 80, body ≤ 500 characters).
+- Dedupe/supersede: similar notes are merged, `--supersede <id>` replaces a specific one.
+- `prune` removes old, unused, unpinned notes.
+- Terse CLI output, German + English stop words.
 
-## Speicherort & Git
-- **Projekt:** `.claude/memory/notes.jsonl` ist die **Wahrheit und wird committet** (eine Notiz pro Zeile, nach ID sortiert → merge-freundlich, ohne lokale Zähler). `memory.db` daneben ist nur ein lokaler Cache; das Plugin legt dafür selbst eine `.gitignore` an. Der Cache baut sich nach Clone, Pull oder Branch-Wechsel automatisch neu auf.
-- **Wichtig für Cloud-Sessions und Teams:** Cloud-Sessions starten mit einem frischen Klon. Gemerkt wird nur, was auf dem Branch liegt, von dem die Session startet – `notes.jsonl` also nach `main` mergen.
-- **Global (`--global`):** `~/.claude/memory/memory.db`, nicht in Git (persönliche Vorlieben).
-- Überschreibbar: `LEAN_MEMORY_DIR`, `LEAN_MEMORY_GLOBAL_DIR`.
+## Storage & Git
+- **Project:** `.claude/memory/notes.jsonl` is the **source of truth and is committed** (one note per line, sorted by id → merge-friendly, no local counters). `memory.db` next to it is only a local cache; the plugin creates a `.gitignore` for it. The cache rebuilds itself after clone, pull or branch switch.
+- **Important for cloud sessions and teams:** cloud sessions start from a fresh clone. Only what is on the branch the session starts from is remembered – so merge `notes.jsonl` into `main`.
+- **Global (`--global`):** `~/.claude/memory/memory.db`, not in Git (personal preferences).
+- Overridable: `LEAN_MEMORY_DIR`, `LEAN_MEMORY_GLOBAL_DIR`.
+- Upgrade path: a database from an older version without `notes.jsonl` is exported once on first access; `stats` warns if `memory.db` is still tracked by Git.
 
-## Automatischer Start in neuen Repos
-Gibt es in einem Git-Repo noch keine Notizen, hängt der Sessionstart-Hook einmalig einen kurzen Hinweis an (~70 Tokens). Claude erledigt danach seine erste Aufgabe und führt dann `/lean-memory:bootstrap` aus: begrenzt (~10 Lesezugriffe, max. 25 Notizen), nur Nicht-Ableitbares, feste Themenliste, Pfad-Bindung für Ordnerregeln. Danach verschwindet der Hinweis. Abschalten: `LEAN_MEMORY_AUTOBOOTSTRAP=0`. Der Bootstrap kostet einmalig Tokens für die Erkundung.
+## Automatic start in new repos
+If a Git repo has no notes yet, the SessionStart hook adds a short hint once (~70 tokens). Claude finishes the first request and then runs `/lean-memory:bootstrap`: bounded (~10 reads, max. 25 notes), only non-derivable facts, a fixed topic list, path binding for folder-specific rules. Afterwards the hint disappears. Disable with `LEAN_MEMORY_AUTOBOOTSTRAP=0`. The bootstrap costs tokens once for the exploration.
 
-## Messung: spart es wirklich Tokens?
+## Measurement: does it really save tokens?
 
-Gemessen an einem echten Repo (aurora-ssh, Rust, 30 Notizen, davon 24 pfadgebunden) mit `claude -p` headless, 3 Läufe je Frage und Variante (18 Läufe), gleiche schreibgeschützte Werkzeuge, gleiches Modell. **Ohne Plugin** heißt: Repo-Stand vor den Notizen, kein `lean-memory` geladen. **Mit Plugin:** Version 0.3.0, Notizen als `notes.jsonl`.
+Measured on a real repo (aurora-ssh, Rust, 30 notes, 24 of them path-scoped) with headless `claude -p`, 3 runs per question and variant (18 runs), same read-only tools, same model. **Without plugin** means: repo state before the notes, no `lean-memory` loaded. **With plugin:** version 0.3.0, notes as `notes.jsonl`.
 
-| Frage | Notizen passen? | Kosten ohne → mit | Zeit | Werkzeug-Aufrufe |
+| Question | Do the notes fit? | Cost without → with | Time | Tool calls |
 |---|---|---|---|---|
-| Release veröffentlichen | ja, direkt | $0.207 → $0.085 (**−59 %**) | 24 s → 16 s | 4 → 1,3 |
-| RDP-Laufwerk ergänzen, bauen und testen | teilweise | $0.254 → $0.206 (**−19 %**) | 44 s → 32 s | 7,3 → 5,7 |
-| Hauptdatei und Rust-Edition finden | nein | $0.078 → $0.076 (**−2 %**) | 11 s → 11 s | 2 → 1,7 |
-| **Alle** | | $0.180 → $0.122 (**−32 %**) | −26 % | 4,4 → 2,9 |
+| Publish a new release | yes, directly | $0.207 → $0.085 (**−59 %**) | 24 s → 16 s | 4 → 1.3 |
+| Extend RDP drive sharing, build and test | partly | $0.254 → $0.206 (**−19 %**) | 44 s → 32 s | 7.3 → 5.7 |
+| Find main file and Rust edition | no | $0.078 → $0.076 (**−2 %**) | 11 s → 11 s | 2 → 1.7 |
+| **All** | | $0.180 → $0.122 (**−32 %**) | −26 % | 4.4 → 2.9 |
 
-- **Wo es spart:** Bei Fragen, zu denen es passende Notizen gibt. Claude kennt dann die richtigen Stellen und liest gezielt statt das Repo zu durchsuchen. Bei Fragen ohne Bezug zu den Notizen ist der Aufwand des Plugins (Index ca. 230 Tokens pro Sessionstart) im Rauschen nicht messbar.
-- **Qualität:** Etwa gleich. Eine Prüfung gegen je 8 im Repo belegte Fakten ergab Ø 5,0 (mit) gegen 5,3 (ohne) bei der Release-Frage und Ø 5,7 gegen 6,0 bei der RDP-Frage. Das Plugin macht die Antworten nicht besser, nur den Weg dorthin günstiger. Auch mit Plugin fehlte bei der Release-Frage die Signierreihenfolge aus den Notizen.
-- **Kosten** sind der aussagekräftigste Wert, weil Cache-Lesezugriffe günstiger berechnet werden. Der reine Kontextverbrauch lag im Mittel bei 192.000 → 129.000 Tokens (−33 %), enthält aber bei jedem Zug die Grundlast von ca. 41.000 Tokens.
+- **Where it saves:** on questions that have matching notes. Claude then knows the right places and reads selectively instead of searching the repo. On questions unrelated to the notes, the plugin's overhead (index ≈ 230 tokens per session start) is not measurable within the noise.
+- **Quality:** about the same. A check against 8 repo-verified facts per question gave an average of 5.0 (with) vs. 5.3 (without) for the release question and 5.7 vs. 6.0 for the RDP question. The plugin does not make answers better, only the way to them cheaper. Even with the plugin, the release answer missed the signing order that is in the notes.
+- **Cost** is the most meaningful figure because cache reads are billed at a lower rate. Raw context use averaged 192,000 → 129,000 tokens (−33 %), but includes the ≈ 41,000-token base load on every turn.
 
-**Grenzen:** Nur 3 Läufe je Zelle bei großer Streuung (RDP ohne Plugin: 199.000 bis 368.000 Tokens), die Richtung ist klar, die genauen Prozente nicht. Zwei der drei Fragen sind passend zu den Notizen gewählt, im Alltag überwiegen Fragen ohne Treffer, also eher 0 bis 59 % pro Frage als pauschal 32 %. Die Faktenprüfung arbeitet mit Textmustern, nicht mit einer echten Bewertung. Ein Repo, ein Modell, nur headless, keine interaktive Session.
+**Limits:** only 3 runs per cell with large variance (RDP without plugin: 199,000 to 368,000 tokens) – the direction is clear, the exact percentages are not. Two of the three questions were chosen to fit the notes; in daily use questions without a match dominate, so expect roughly 0 to 59 % per question rather than a flat 32 %. The fact check uses text patterns, not a real grading. One repo, one model, headless only, no interactive session.
 
-**Aufbau, damit der Vergleich fair ist:** Beide Varianten laufen mit eigener, leerer Konfiguration und abgeschalteter Plugin-/Skill-Synchronisierung (`CLAUDE_CODE_SYNC_PLUGINS=0`). Der Repo-Stand ohne Notizen enthält auch in der Git-Historie keine Spur davon. Zwei frühere Messreihen waren verfälscht (Plugin über die Kontosynchronisierung geladen, Notizen über `git show HEAD` gefunden) und sind verworfen. Wer nachmessen will, muss beides ausschließen und im Lauf prüfen, welche Plugins geladen sind.
+**Setup, to keep the comparison fair:** both variants run with their own empty config and plugin/skill sync switched off (`CLAUDE_CODE_SYNC_PLUGINS=0`). The repo state without notes contains no trace of them, not even in the Git history. Two earlier measurement series were invalid (plugin loaded via account sync, notes found via `git show HEAD`) and were discarded. Anyone re-measuring must rule out both and check in each run which plugins were loaded.
 
 ## Installation
 ```
@@ -60,15 +61,15 @@ Gemessen an einem echten Repo (aurora-ssh, Rust, 30 Notizen, davon 24 pfadgebund
 /plugin install lean-memory@claude-memory
 ```
 
-## Nutzung
-- `/lean-memory:bootstrap` (Erstbefüllung) · `/lean-memory:remember <text>` · `/lean-memory:recall <query>` · `/lean-memory:forget <id>`
-- CLI (nutzt Claude selbst, siehe `skills/memory/SKILL.md`):
+## Usage
+- `/lean-memory:bootstrap` (initial fill) · `/lean-memory:remember <text>` · `/lean-memory:recall <query>` · `/lean-memory:forget <id>`
+- CLI (Claude uses it itself, see `skills/memory/SKILL.md`):
   `node scripts/mem.mjs add|search|get|list|topics|forget|pin|unpin|index|stats|prune`
-- Beispiel Pfad-Scoping: `add --title "Rundung half-even" --body "…" --paths "src/billing/**" --topic billing`
-- `stats` zeigt Session-Start-Kosten in Tokens.
+- Path-scoping example: `add --title "Round half-even" --body "…" --paths "src/billing/**" --topic billing`
+- `stats` shows the plugin version and the session-start cost in tokens.
 
-## Einstellungen (Env)
-`LEAN_MEMORY_INDEX_TOKENS` (500) · `LEAN_MEMORY_MAX_HITS` (3) · `LEAN_MEMORY_PROMPT_TOKENS` (250) · `LEAN_MEMORY_PATH_NOTES` (5) · `LEAN_MEMORY_PATH_TOKENS` (400)
+## Settings (env)
+`LEAN_MEMORY_INDEX_TOKENS` (500) · `LEAN_MEMORY_MAX_HITS` (3) · `LEAN_MEMORY_PROMPT_TOKENS` (250) · `LEAN_MEMORY_PATH_NOTES` (5) · `LEAN_MEMORY_PATH_TOKENS` (400) · `LEAN_MEMORY_AUTOBOOTSTRAP` (`0` disables the bootstrap hint)
 
 ## Tests
 `node --test`
