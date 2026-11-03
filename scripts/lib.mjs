@@ -47,13 +47,19 @@ CREATE TABLE IF NOT EXISTS notes(
 CREATE INDEX IF NOT EXISTS notes_topic ON notes(topic);
 CREATE INDEX IF NOT EXISTS notes_paths ON notes(paths) WHERE paths != '';
 CREATE INDEX IF NOT EXISTS notes_updated ON notes(updated);
+CREATE TABLE IF NOT EXISTS meta(k TEXT PRIMARY KEY, v TEXT);
 CREATE VIRTUAL TABLE IF NOT EXISTS fts USING fts5(title, tags, body);`;
 
-/** Open a store. Read-only callers (hooks) pass create:false and get null when nothing exists yet. */
+/**
+ * Open a store. Read-only callers (hooks) pass create:false and get null when nothing exists yet.
+ * Project scope: `notes.jsonl` (tracked in git, sorted by id, merge-friendly) is the source of truth;
+ * `memory.db` is a local, git-ignored cache that is rebuilt whenever notes.jsonl changed (fresh clone, pull, branch switch).
+ */
 export function openStore(dir, scope, { create = false } = {}) {
   const file = path.join(dir, 'memory.db');
   const legacy = path.join(dir, 'memories.jsonl');
-  if (!fs.existsSync(file) && !create && !fs.existsSync(legacy)) return null;
+  const jsonl = scope === 'project' ? path.join(dir, 'notes.jsonl') : null;
+  if (!fs.existsSync(file) && !create && !fs.existsSync(legacy) && !(jsonl && fs.existsSync(jsonl))) return null;
   fs.mkdirSync(dir, { recursive: true });
   const db = new DatabaseSync(file);
   db.exec('PRAGMA busy_timeout=5000'); // must come first so concurrent first-time opens wait instead of failing
@@ -63,9 +69,51 @@ export function openStore(dir, scope, { create = false } = {}) {
       Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 50 * (attempt + 1));
     }
   }
-  const store = { db, scope, dir, file };
+  const store = { db, scope, dir, file, jsonl };
+  if (jsonl) {
+    const gi = path.join(dir, '.gitignore');
+    if (!fs.existsSync(gi)) { try { fs.writeFileSync(gi, 'memory.db\nmemory.db-wal\nmemory.db-shm\n'); } catch { /* best effort */ } }
+  }
   if (fs.existsSync(legacy)) migrate(store, legacy);
+  syncFromJsonl(store);
   return store;
+}
+
+const sigOf = (f) => { try { const st = fs.statSync(f); return `${st.size}:${Math.floor(st.mtimeMs)}`; } catch { return null; } };
+const metaGet = (db, k) => db.prepare('SELECT v FROM meta WHERE k=?').get(k)?.v;
+const metaSet = (db, k, v) => db.prepare('INSERT OR REPLACE INTO meta(k,v) VALUES(?,?)').run(k, v);
+
+/** Rebuild the SQLite cache from notes.jsonl when the file changed since we last saw it. Local hit counters survive. */
+function syncFromJsonl(store) {
+  if (!store.jsonl) return;
+  const sig = sigOf(store.jsonl);
+  if (!sig || metaGet(store.db, 'jsonl_sig') === sig) return;
+  const rows = fs.readFileSync(store.jsonl, 'utf8').split('\n').filter(Boolean).map((l) => { try { return JSON.parse(l); } catch { return null; } }).filter((e) => e && e.id && e.title);
+  tx(store.db, () => {
+    if (metaGet(store.db, 'jsonl_sig') === sig) return; // another process already synced
+    const hits = new Map(store.db.prepare('SELECT id,hits FROM notes').all().map((r) => [r.id, r.hits]));
+    store.db.exec('DELETE FROM notes; DELETE FROM fts;');
+    for (const e of rows) insert(store, { ...e, tags: e.tags || [], paths: e.paths || [], hits: hits.get(e.id) || 0 });
+    metaSet(store.db, 'jsonl_sig', sig);
+  });
+}
+
+/** Write the committed text file (sorted by id, no local counters) after a content change. */
+export function exportJsonl(store) {
+  if (!store.jsonl) return;
+  const rows = store.db.prepare('SELECT id,type,title,body,tags,topic,paths,created,updated,pinned FROM notes ORDER BY id').all();
+  const text = rows.map((r) => JSON.stringify({ ...r, tags: r.tags ? r.tags.split(',') : [], paths: r.paths ? r.paths.split(',') : [], pinned: !!r.pinned })).join('\n') + (rows.length ? '\n' : '');
+  const tmp = `${store.jsonl}.${process.pid}.tmp`;
+  fs.writeFileSync(tmp, text);
+  fs.renameSync(tmp, store.jsonl);
+  metaSet(store.db, 'jsonl_sig', sigOf(store.jsonl));
+}
+
+/** Transaction + export. Use for every content change (not for hit counters). */
+export function write(store, fn) {
+  const r = tx(store.db, fn);
+  exportJsonl(store);
+  return r;
 }
 
 function migrate(store, legacy) {
@@ -73,6 +121,7 @@ function migrate(store, legacy) {
     const rows = fs.readFileSync(legacy, 'utf8').split('\n').filter(Boolean).map((l) => { try { return JSON.parse(l); } catch { return null; } }).filter(Boolean);
     tx(store.db, () => { for (const e of rows) if (!getById(store, e.id)) insert(store, { ...e, tags: e.tags || [], paths: [], topic: e.tags?.[0] }); });
     fs.renameSync(legacy, legacy + '.migrated');
+    exportJsonl(store);
   } catch { /* leave the legacy file untouched */ }
 }
 
@@ -268,3 +317,7 @@ export function seenAdd(sid, ids) { try { fs.writeFileSync(seenFile(sid), JSON.s
 export async function readStdinJson() {
   try { return JSON.parse(await new Promise((r) => { let s = ''; process.stdin.on('data', (c) => (s += c)); process.stdin.on('end', () => r(s || '{}')); })); } catch { return {}; }
 }
+
+export const bootstrapHint = (scriptPath) =>
+  `[memory] No notes for this repo yet. CLI: node "${scriptPath}". After finishing the user's first request, bootstrap the memory once: ` +
+  `invoke the lean-memory:bootstrap skill (bounded: ~10 reads, <=25 notes; skip if the repo is trivial/empty), then remind the user to commit .claude/memory/notes.jsonl.`;

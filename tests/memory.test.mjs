@@ -95,3 +95,56 @@ test('migrates legacy memories.jsonl', () => {
   assert.match(r.stdout, /Legacy note kiwi/);
   assert.ok(fs.existsSync(path.join(d, 'memories.jsonl.migrated')));
 });
+
+// ---- git-tracked source of truth + bootstrap hint ----
+function repo() {
+  const r = fs.mkdtempSync(path.join(os.tmpdir(), 'lmrepo-'));
+  fs.mkdirSync(path.join(r, '.git'));
+  const e = { ...process.env, CLAUDE_PROJECT_DIR: r, LEAN_MEMORY_GLOBAL_DIR: path.join(r, '_g') };
+  delete e.LEAN_MEMORY_DIR;
+  const sh = (script, args = [], input) => spawnSync('node', [path.join(root, 'scripts', script), ...args], { env: e, input, encoding: 'utf8', cwd: r });
+  return { r, sh, mem: (...a) => sh('mem.mjs', a), dir: path.join(r, '.claude', 'memory') };
+}
+
+test('notes.jsonl is written (sorted, no hit counters) and memory.db is git-ignored', () => {
+  const { mem, dir } = repo();
+  mem('add', '--title', 'Zeta rule', '--body', 'zeta body unique1', '--topic', 'build');
+  mem('add', '--title', 'Alpha rule', '--body', 'alpha body unique2', '--topic', 'build');
+  const id = mem('list').stdout.split(' ')[0];
+  mem('get', id); // bumps local hits only
+  const lines = fs.readFileSync(path.join(dir, 'notes.jsonl'), 'utf8').trim().split('\n').map((l) => JSON.parse(l));
+  assert.equal(lines.length, 2);
+  assert.deepEqual(lines.map((l) => l.id), lines.map((l) => l.id).sort());
+  assert.ok(!('hits' in lines[0]));
+  assert.match(fs.readFileSync(path.join(dir, '.gitignore'), 'utf8'), /memory\.db/);
+});
+
+test('fresh clone: db is rebuilt from notes.jsonl; later edits to the file are picked up', () => {
+  const { mem, dir } = repo();
+  mem('add', '--title', 'Use SQLite not Postgres', '--body', 'raspberry pi has little ram', '--tags', 'data');
+  for (const f of ['memory.db', 'memory.db-wal', 'memory.db-shm']) fs.rmSync(path.join(dir, f), { force: true });
+  assert.match(mem('search', 'sqlite raspberry').stdout, /Use SQLite not Postgres/);
+  // simulate a pull that adds a note
+  const extra = { id: 'ffffff', type: 'fact', title: 'Pulled note quince', body: 'quince arrived via git pull', tags: [], topic: 'misc', paths: [], created: '2026-01-01T00:00:00Z', updated: '2026-01-01T00:00:00Z', pinned: false };
+  fs.appendFileSync(path.join(dir, 'notes.jsonl'), JSON.stringify(extra) + '\n');
+  assert.match(mem('search', 'quince').stdout, /Pulled note quince/);
+  // forget removes it from the file too
+  mem('forget', 'ffffff');
+  assert.doesNotMatch(fs.readFileSync(path.join(dir, 'notes.jsonl'), 'utf8'), /ffffff/);
+});
+
+test('bootstrap hint: only in a git repo without notes, once notes exist it disappears', () => {
+  const a = repo();
+  const hint = ctx(a.sh('session-start.mjs', [], '{}'));
+  assert.match(hint, /No notes for this repo yet/);
+  assert.match(hint, /lean-memory:bootstrap/);
+  a.mem('add', '--title', 'First note apple', '--body', 'apple body');
+  assert.doesNotMatch(ctx(a.sh('session-start.mjs', [], '{}')), /No notes for this repo yet/);
+  // opt-out and non-git dirs stay silent
+  const b = repo();
+  const off = spawnSync('node', [path.join(root, 'scripts/session-start.mjs')], { env: { ...process.env, CLAUDE_PROJECT_DIR: b.r, LEAN_MEMORY_GLOBAL_DIR: path.join(b.r, '_g'), LEAN_MEMORY_AUTOBOOTSTRAP: '0' }, input: '{}', encoding: 'utf8', cwd: b.r });
+  assert.equal(off.stdout, '');
+  const plain = fs.mkdtempSync(path.join(os.tmpdir(), 'lmplain-'));
+  const q = spawnSync('node', [path.join(root, 'scripts/session-start.mjs')], { env: { ...process.env, CLAUDE_PROJECT_DIR: plain, LEAN_MEMORY_GLOBAL_DIR: path.join(plain, '_g') }, input: '{}', encoding: 'utf8', cwd: plain });
+  assert.equal(q.stdout, '');
+});

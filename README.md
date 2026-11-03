@@ -26,10 +26,14 @@ Ziel: Claude erinnert sich an Entscheidungen, Stolperfallen und Präferenzen, **
 - `prune` entfernt alte, ungenutzte, nicht angepinnte Notizen.
 - Terse CLI-Ausgabe, deutsche + englische Stoppwörter.
 
-## Speicherort
-- Projekt: `<projekt>/.claude/memory/memory.db` (in `.gitignore` aufnehmen oder bewusst teilen)
-- Global (`--global`): `~/.claude/memory/memory.db`
-- Überschreibbar: `LEAN_MEMORY_DIR`, `LEAN_MEMORY_GLOBAL_DIR`
+## Speicherort & Git
+- **Projekt:** `.claude/memory/notes.jsonl` ist die **Wahrheit und wird committet** (eine Notiz pro Zeile, nach ID sortiert → merge-freundlich, ohne lokale Zähler). `memory.db` daneben ist nur ein lokaler Cache; das Plugin legt dafür selbst eine `.gitignore` an. Der Cache baut sich nach Clone, Pull oder Branch-Wechsel automatisch neu auf.
+- **Wichtig für Cloud-Sessions und Teams:** Cloud-Sessions starten mit einem frischen Klon. Gemerkt wird nur, was auf dem Branch liegt, von dem die Session startet – `notes.jsonl` also nach `main` mergen.
+- **Global (`--global`):** `~/.claude/memory/memory.db`, nicht in Git (persönliche Vorlieben).
+- Überschreibbar: `LEAN_MEMORY_DIR`, `LEAN_MEMORY_GLOBAL_DIR`.
+
+## Automatischer Start in neuen Repos
+Gibt es in einem Git-Repo noch keine Notizen, hängt der Sessionstart-Hook einmalig einen kurzen Hinweis an (~70 Tokens). Claude erledigt danach seine erste Aufgabe und führt dann `/lean-memory:bootstrap` aus: begrenzt (~10 Lesezugriffe, max. 25 Notizen), nur Nicht-Ableitbares, feste Themenliste, Pfad-Bindung für Ordnerregeln. Danach verschwindet der Hinweis. Abschalten: `LEAN_MEMORY_AUTOBOOTSTRAP=0`. Der Bootstrap kostet einmalig Tokens für die Erkundung.
 
 ## Installation
 ```
@@ -38,7 +42,7 @@ Ziel: Claude erinnert sich an Entscheidungen, Stolperfallen und Präferenzen, **
 ```
 
 ## Nutzung
-- `/lean-memory:remember <text>` · `/lean-memory:recall <query>` · `/lean-memory:forget <id>`
+- `/lean-memory:bootstrap` (Erstbefüllung) · `/lean-memory:remember <text>` · `/lean-memory:recall <query>` · `/lean-memory:forget <id>`
 - CLI (nutzt Claude selbst, siehe `skills/memory/SKILL.md`):
   `node scripts/mem.mjs add|search|get|list|topics|forget|pin|unpin|index|stats|prune`
 - Beispiel Pfad-Scoping: `add --title "Rundung half-even" --body "…" --paths "src/billing/**" --topic billing`

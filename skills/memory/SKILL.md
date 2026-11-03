@@ -30,3 +30,7 @@ Rules:
 - `forget <id...>` remove outdated notes — do this as soon as you notice a note is wrong.
 - `pin <id>` keep a note always at the top of the index.
 - `prune [--days 90] [--apply]` drop unused, old, unpinned notes. `stats` shows the session-start token cost.
+
+## Persistence & git
+Project notes live in `.claude/memory/notes.jsonl` (tracked in git); `memory.db` next to it is a git-ignored cache that rebuilds itself after clone/pull/branch switch. After saving notes, remind the user to **commit `notes.jsonl`** — only what is on the branch a session starts from is remembered in cloud sessions.
+No notes yet in a git repo? Run the `lean-memory:bootstrap` skill once.

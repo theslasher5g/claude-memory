@@ -2,8 +2,8 @@
 // lean-memory CLI. Output is deliberately terse: every byte printed costs tokens.
 import { fileURLToPath } from 'node:url';
 import {
-  LIMITS, TYPES, estTokens, openAll, stores, tx, search, findSimilar, newId, buildIndex, shortId, rank,
-  insert, update, remove, getById, bumpHits, resolve, topicCounts,
+  LIMITS, TYPES, estTokens, openAll, stores, search, findSimilar, newId, buildIndex, shortId, rank,
+  insert, update, remove, getById, bumpHits, resolve, topicCounts, write,
 } from './lib.mjs';
 
 const SELF = fileURLToPath(import.meta.url);
@@ -41,11 +41,11 @@ function cmdAdd(all, f) {
   if (target) {
     const patch = { type, title, body, tags: tags.length ? tags : target.e.tags, paths: paths.length ? paths : target.e.paths, pinned: f.pin ? true : target.e.pinned };
     if (topic) patch.topic = topic;
-    tx(target.store.db, () => update(target.store, target.e.id, patch));
+    write(target.store, () => update(target.store, target.e.id, patch));
     return `updated ${shortId(target.e)}`;
   }
   const e = { id: newId(store), type, title, body, tags, topic, paths, pinned: !!f.pin, scope: store.scope };
-  tx(store.db, () => insert(store, e));
+  write(store, () => insert(store, e));
   return `saved ${shortId(e)}`;
 }
 
@@ -79,12 +79,12 @@ function run(cmd, pos, f) {
     case 'topics': { const t = topicCounts(all); return t.length ? t.map(([n, c]) => `${n}(${c})`).join(' ') : 'empty'; }
     case 'forget': {
       if (!pos.length) die('usage: forget <id...>');
-      return pos.map((ref) => { const t = resolve(all, ref); if (!t) return `${ref}: not found`; tx(t.store.db, () => remove(t.store, t.e.id)); return `forgot ${ref}`; }).join('\n');
+      return pos.map((ref) => { const t = resolve(all, ref); if (!t) return `${ref}: not found`; write(t.store, () => remove(t.store, t.e.id)); return `forgot ${ref}`; }).join('\n');
     }
     case 'pin': case 'unpin': {
       return pos.map((ref) => {
         const t = resolve(all, ref); if (!t) return `${ref}: not found`;
-        tx(t.store.db, () => update(t.store, t.e.id, { pinned: cmd === 'pin' })); return `${cmd}ned ${ref}`;
+        write(t.store, () => update(t.store, t.e.id, { pinned: cmd === 'pin' })); return `${cmd}ned ${ref}`;
       }).join('\n');
     }
     case 'index': return buildIndex(all, SELF);
@@ -98,7 +98,7 @@ function run(cmd, pos, f) {
       const stale = [];
       for (const s of stores(all)) for (const r of s.db.prepare('SELECT id FROM notes WHERE pinned=0 AND hits=0 AND updated<?').all(cutoff)) stale.push({ s, e: getById(s, r.id) });
       if (!f.apply) return stale.length ? `would remove ${stale.length} (unused, >${days}d, unpinned; add --apply):\n` + stale.map((x) => fmt(x.e)).join('\n') : 'nothing to prune';
-      for (const { s, e } of stale) tx(s.db, () => remove(s, e.id));
+      for (const { s, e } of stale) write(s, () => remove(s, e.id));
       return `removed ${stale.length}`;
     }
     default:
