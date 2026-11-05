@@ -276,3 +276,22 @@ test('path hook also fires for Bash, Grep and Glob that name a matching path (on
   const s = sid(); const call = () => sh('pre-tool-use.mjs', [], ev('Bash', { command: 'cat crates/rdp/src/drive.rs' }, s)).stdout;
   assert.notEqual(call(), ''); assert.equal(call(), '');                                                // once per session
 });
+
+test('stale-notes nudge: only when notes are old AND the repo moved on; not after compaction; can be disabled', () => {
+  const { r, mem, sh, dir } = gitRepo(['a.txt']);
+  const git = (...a) => spawnSync('git', ['-c', 'user.email=t@t', '-c', 'user.name=t', ...a], { cwd: r, encoding: 'utf8' });
+  mem('add', '--title', 'Old decision about tick rate', '--body', 'server ticks at 20 Hz');
+  git('commit', '-q', '-m', 'init');
+  const start = (input = {}, extra = {}) => ctx(spawnSync('node', [path.join(root, 'scripts/session-start.mjs')], { cwd: r, input: JSON.stringify({ cwd: r, ...input }), encoding: 'utf8', env: { ...process.env, CLAUDE_PROJECT_DIR: r, LEAN_MEMORY_GLOBAL_DIR: path.join(r, '_g'), LEAN_MEMORY_DIR: '', ...extra } }));
+  const old = new Date(Date.now() - 3 * 864e5).toISOString();
+  const f = path.join(dir, 'notes.jsonl');
+  fs.writeFileSync(f, fs.readFileSync(f, 'utf8').replace(/"(created|updated)":"[^"]+"/g, `"$1":"${old}"`));
+  assert.doesNotMatch(start(), /Notes last updated/);                          // old notes, but only 1 commit since
+  for (let i = 0; i < 9; i++) git('commit', '-q', '--allow-empty', '-m', `change ${i}`);
+  assert.match(start(), /\[memory\] Notes last updated 3 d ago, 10 commits since/);
+  assert.doesNotMatch(start({ source: 'compact' }), /Notes last updated/);
+  assert.doesNotMatch(start({}, { LEAN_MEMORY_NUDGE: '0' }), /Notes last updated/);
+  assert.doesNotMatch(start({}, { LEAN_MEMORY_NUDGE_COMMITS: '50' }), /Notes last updated/);
+  mem('add', '--title', 'Fresh decision about netcode', '--body', 'host authoritative, clients send intents only');
+  assert.doesNotMatch(start(), /Notes last updated/);                          // a new note resets it
+});

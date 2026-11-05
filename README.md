@@ -76,9 +76,10 @@ Measured on a real repo (aurora-ssh, Rust, 30 notes, 24 of them path-scoped) wit
 - `stats` shows the plugin version and the session-start cost in tokens.
 
 ## Settings (env)
-`LEAN_MEMORY_INDEX_TOKENS` (500) · `LEAN_MEMORY_MAX_HITS` (3) · `LEAN_MEMORY_PROMPT_TOKENS` (250) · `LEAN_MEMORY_PATH_NOTES` (5) · `LEAN_MEMORY_PATH_TOKENS` (400) · `LEAN_MEMORY_AUTOBOOTSTRAP` (`0` disables the bootstrap hint)
+`LEAN_MEMORY_INDEX_TOKENS` (500) · `LEAN_MEMORY_MAX_HITS` (3) · `LEAN_MEMORY_PROMPT_TOKENS` (250) · `LEAN_MEMORY_PATH_NOTES` (5) · `LEAN_MEMORY_PATH_TOKENS` (400) · `LEAN_MEMORY_AUTOBOOTSTRAP` (`0` disables the bootstrap hint) · `LEAN_MEMORY_NUDGE` (`0` disables the stale-notes nudge) · `LEAN_MEMORY_NUDGE_COMMITS` (8)
 
 ## Changelog
+- **0.4.1** – session-start nudge when notes are stale but the repo moved on (≥ 24 h since the last note and ≥ 8 commits since; one line, ≈ 40 tokens; not after compaction). Found in a real two-day project: 10 notes from day one, 24 commits of new decisions later, no new notes – saving is the weak link, reading works. Settings: `LEAN_MEMORY_NUDGE=0`, `LEAN_MEMORY_NUDGE_COMMITS` (8).
 - **0.4.0** – `doctor`, `merge`, `/lean-memory:consolidate`; path notes now also load for Grep/Glob/Bash (in the measurement above Claude used almost only Bash/Grep, so the path hook never fired); pinned path-scoped notes appear in the index; topic is searchable. **Fix:** `notes.jsonl` and the SQLite cache could lose a note when sessions wrote and opened the store at the same time (cache rebuild raced with an unexported write). Writes and export now share one transaction and a rebuild re-checks the file under the lock; a stress test (concurrent writers and readers) reproduces the old bug in 3 of 8 runs and passes with the fix. **0.3.0 is affected, please update.**
 - **0.3.0** – `notes.jsonl` as git-tracked source of truth, automatic bootstrap hint, version in `stats`.
 - **0.2.0** – SQLite/FTS5 storage, path-scoped notes, topic index.
